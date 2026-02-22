@@ -1,0 +1,38 @@
+[package]
+name = "rust_wallet_helper"
+version = "0.1.0"
+edition = "2024"
+# not meant to be published as a crate
+publish = false
+
+[dependencies]
+# # TODO check if this is the best crate for this
+# # used for some Ethereum address computation
+# # last release in 2020, deprecated?
+tiny-keccak = { version = "2.0.2", features = ["keccak"] }
+
+# unmaintained, last release in Mar 3, 2021
+# faster options available?
+hex = "0.4.3"
+
+# for Bitcoin Cash check
+cashaddr = { version = "0.2.0", features = ["convert"] }
+
+bitcoin = { version = "0.99.0", features = [
+    "std",
+], default-features = false } # special handling, see below
+
+# https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html
+[patch.crates-io]
+# use custom unsafe fast version
+bitcoin = { git = "https://git.distrust.co/milksad/rust-bitcoin-unsafe-fast" }
+
+# use custom unsafe fast version
+secp256k1 = { git = "https://git.distrust.co/milksad/rust-secp256k1-unsafe-fast" }
+
+[profile.release]
+# leads to faster + smaller binaries
+panic = 'abort'
+# slower compilation but potentially faster runtime
+codegen-units = 1
+lto = "thin"

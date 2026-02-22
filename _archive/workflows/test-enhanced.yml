@@ -1,0 +1,380 @@
+name: Enhanced Rust CI - Story 1.9.1 ATDD Support
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Weekly burn-in on Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Stage 1: Fast Checks
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/git
+          key: ${{ runner.os }}-cargo-index-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Run cargo check
+        run: cargo check --all-targets --all-features
+
+  # Stage 2: Unit Tests
+  test-unit:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Run unit tests
+        run: cargo test --lib --verbose
+      
+      - name: Upload unit test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-failures
+          path: target/debug/
+          retention-days: 7
+
+  # Stage 3: Integration Tests (Story 1.9.1 ATDD)
+  test-integration:
+    name: Integration Tests
+    runs-on: ubuntu-latest
+    needs: test-unit
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      
+      - name: Install OpenCL (ICD Loader)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocl-icd-opencl-dev
+      
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Run integration tests (non-ignored)
+        run: cargo test --test '*' --verbose
+      
+      - name: Run ATDD tests (Story 1.9.1 - currently ignored)
+        run: |
+          echo "🔴 RED Phase: ATDD tests expected to fail"
+          cargo test --test randstorm_comprehensive_configs -- --ignored --nocapture || echo "Expected failures"
+          cargo test --test randstorm_checkpoint -- --ignored --nocapture || echo "Expected failures"
+        continue-on-error: true
+      
+      - name: Upload integration test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: target/debug/
+          retention-days: 7
+
+  # Stage 4: GPU Tests (conditional)
+  test-gpu:
+    name: GPU Tests
+    runs-on: ubuntu-latest
+    needs: test-unit
+    continue-on-error: true # GPU may not be available in CI
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      
+      - name: Install OpenCL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocl-icd-opencl-dev pocl-opencl-icd
+      
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-gpu-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Check OpenCL availability
+        run: |
+          clinfo || echo "⚠️ No GPU detected - tests will be skipped"
+        continue-on-error: true
+      
+      - name: Run GPU tests
+        run: cargo test --features gpu --verbose
+      
+      - name: Run GPU parity tests
+        run: |
+          cargo test --features gpu --test test_gpu_cpu_parity --verbose
+          cargo test --features gpu --test randstorm_gpu_cpu_parity --verbose
+      
+      - name: Upload GPU test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gpu-test-results
+          path: target/debug/
+          retention-days: 7
+
+  # Stage 5: Benchmarks (smoke test only)
+  benchmarks:
+    name: Benchmarks (Smoke Test)
+    runs-on: ubuntu-latest
+    needs: test-unit
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      
+      - name: Install OpenCL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocl-icd-opencl-dev
+      
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-bench-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Compile benchmarks (smoke test)
+        run: cargo bench --no-run --verbose
+      
+      - name: Upload benchmark binaries
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-binaries
+          path: target/release/deps/
+          retention-days: 7
+
+  # Stage 6: Code Quality
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      
+      - name: Run cargo fmt
+        run: cargo fmt --all -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          components: clippy
+      
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Run cargo clippy
+        run: cargo clippy --all-targets --all-features -- -W clippy::all
+
+  security-audit:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+      
+      - name: Cache cargo-audit
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: ${{ runner.os }}-cargo-audit
+      
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked || true
+      
+      - name: Run cargo audit
+        run: cargo audit
+        continue-on-error: true
+
+  # Stage 7: Build Release
+  build:
+    name: Build Release
+    runs-on: ubuntu-latest
+    needs: [check, test-unit, test-integration, fmt, clippy]
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      
+      - name: Install OpenCL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocl-icd-opencl-dev
+      
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Build release
+        run: cargo build --release --verbose
+      
+      - name: Upload release artifact
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: entropy-lab-rs-${{ github.sha }}
+          path: target/release/entropy-lab-rs
+          retention-days: 30
+
+  # Stage 8: Burn-In Loop (weekly or on-demand)
+  burn-in:
+    name: Flaky Test Detection (Burn-In)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || contains(github.event.head_commit.message, '[burn-in]')
+    needs: test-integration
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      
+      - name: Install OpenCL
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ocl-icd-opencl-dev
+      
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-burn-in-${{ hashFiles('**/Cargo.lock') }}
+      
+      - name: Run burn-in loop (10 iterations)
+        run: |
+          for i in {1..10}; do
+            echo "🔥 Burn-in iteration $i/10"
+            cargo test --lib --verbose || exit 1
+          done
+      
+      - name: Upload burn-in failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: burn-in-failures
+          path: target/debug/
+          retention-days: 30
+
+  # Stage 9: Quality Gate (Story 1.9.1 Blocker Resolution)
+  quality-gate:
+    name: Quality Gate - Story 1.9.1
+    runs-on: ubuntu-latest
+    needs: [test-unit, test-integration, fmt, clippy]
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Check blockers status
+        run: |
+          echo "📊 Quality Gate - Story 1.9.1 Blocker Resolution"
+          echo ""
+          echo "Current Status:"
+          echo "- BLOCKER-1: End-to-end crypto validation (5 tests) - 🔴 RED"
+          echo "- BLOCKER-2: Performance validation (3 tests) - 🔴 RED"
+          echo "- BLOCKER-3: GPU tests mapped - 🟡 PENDING"
+          echo "- BLOCKER-4: Checkpoint/resume (5 tests) - 🔴 RED"
+          echo "- BLOCKER-5: Test vectors cited - 🟡 PENDING"
+          echo ""
+          echo "⚠️ To pass quality gate, resolve all 5 blockers"
+          echo "See: _bmad-output/traceability-matrix-story-1.9.md"
+      
+      - name: Fail if blockers unresolved
+        run: |
+          # This will fail until Story 1.9.1 is complete
+          # Remove this check when all ATDD tests pass
+          echo "❌ Quality gate: FAIL (blockers unresolved)"
+          exit 1
+        continue-on-error: true # Allow PR to continue for visibility

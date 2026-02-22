@@ -1,0 +1,167 @@
+[package]
+name = "temporal-planetarium-lib"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+gpu = ["dep:ocl"]
+gui = ["dep:eframe", "dep:egui"]
+z3-solver = ["dep:z3"]
+wgpu = ["dep:wgpu"]
+postgres = ["dep:tokio-postgres", "dep:deadpool-postgres", "dep:tokio"]
+
+[dependencies]
+bitcoin = { version = "0.32", features = ["rand"] }
+rand = "0.8"
+rand_core = "0.6"
+sha2 = "0.10"
+sha3 = "0.10"
+hmac = "0.12"
+pbkdf2 = "0.12"
+ripemd = "0.1"
+secp256k1 = { version = "0.29", features = ["rand", "global-context"] }
+aes-gcm = "0.10"
+hex = "0.4"
+anyhow = "1.0"
+bip39 = "2.0"
+chrono = "0.4"
+dotenv = "0.15"
+indicatif = "0.17"
+rand_mt = "4.2"
+num_cpus = "1.13"
+rand_chacha = "0.3"
+crossbeam-channel = "0.5"
+bloom = "0.3"
+csv = "1.3"
+rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+flate2 = "1.0"
+bitcoincore-rpc = "0.19"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+ocl = { version = "0.19", optional = true }
+md5 = "0.7"
+num-bigint = "0.4"
+num-traits = "0.2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+bs58 = { version = "0.5.1", features = ["check"] }
+bech32 = "0.11.1"
+bloomfilter = { version = "3.0.1", features = ["serde"] }
+serde_json = "1.0.145"
+siphasher = { version = "1.0.1", features = ["serde"] }
+eframe = { version = "0.29", optional = true }
+egui = { version = "0.29", optional = true }
+z3 = { version = "0.12", optional = true }
+rusqlite = { version = "0.31", features = ["bundled"] }
+tokio-postgres = { version = "0.7", optional = true }
+deadpool-postgres = { version = "0.12", optional = true }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros"], optional = true }
+wgpu = { version = "22.1", optional = true }
+sysinfo = "0.30"
+bytemuck = { version = "1.16", features = ["derive"] }
+pollster = "0.3"
+
+[[bench]]
+name = "gpu_optimization_benchmark"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "randstorm_streaming"
+harness = false
+
+[[bench]]
+name = "trust_wallet_benchmark"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "cryptodeeptools_comp"
+harness = false
+
+[[bench]]
+name = "bloom_vs_linear"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "gpu_derivation_benchmark"
+harness = false
+required-features = ["gpu"]
+
+[[bench]]
+name = "brainwallet_benchmark"
+harness = false
+
+[dev-dependencies]
+criterion = "0.8.1"
+tempfile = "3.23.0"
+assert_cmd = "2.0"
+predicates = "3.1"
+scopeguard = "1.2"
+
+# Integration tests from workspace root
+[[test]]
+name = "test_forensics_vectors"
+path = "../../tests/test_forensics_vectors.rs"
+
+[[test]]
+name = "test_milk_sad_pipeline"
+path = "../../tests/test_milk_sad_pipeline.rs"
+
+[[test]]
+name = "test_brainwallet_cryptography"
+path = "../../tests/test_brainwallet_cryptography.rs"
+
+[[test]]
+name = "test_gpu_cpu_parity"
+path = "../../tests/test_gpu_cpu_parity.rs"
+
+[[test]]
+name = "randstorm_cli_integration"
+path = "../../tests/randstorm_cli_integration.rs"
+
+[[test]]
+name = "randstorm_performance"
+path = "../../tests/randstorm_performance.rs"
+
+[[bench]]
+name = "wgpu_metal_benchmark"
+harness = false
+required-features = ["wgpu"]
+
+[[test]]
+name = "gpu_bloom_filter_test"
+path = "../../tests/gpu_bloom_filter_test.rs"
+
+[[test]]
+name = "cake_wallet_unit"
+path = "../../tests/cake_wallet_unit.rs"
+
+[[test]]
+name = "trust_wallet_unit"
+path = "../../tests/trust_wallet_unit.rs"
+[[test]]
+name = "randstorm_comprehensive_configs"
+path = "../../tests/randstorm_comprehensive_configs.rs"
+
+[[test]]
+name = "verify_rpc"
+path = "../../tests/verify_rpc.rs"
+
+[[test]]
+name = "test_nonce_reuse_integration"
+path = "../../tests/test_nonce_reuse_integration.rs"
+
+[[test]]
+name = "test_brainwallet_import"
+path = "../../tests/test_brainwallet_import.rs"
+
+[[test]]
+name = "test_cli_brainwallet"
+path = "../../tests/test_cli_brainwallet.rs"
+
+[[test]]
+name = "randstorm_integration"
+path = "../../tests/randstorm_integration.rs"

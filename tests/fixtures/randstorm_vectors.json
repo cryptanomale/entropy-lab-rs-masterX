@@ -1,0 +1,41 @@
+{
+  "description": "Randstorm MWC1616 PRNG Tier 4 Verification Vectors",
+  "version": "1.0.0",
+  "reference": "V8 3.14.5.9 src/math.cc MWC1616 algorithm",
+  "vectors": [
+    {
+      "name": "Canonical MWC1616 1000-output test",
+      "description": "1000 consecutive outputs from known seed, hashed with SHA256",
+      "seed": {
+        "s1": "0x12345678",
+        "s2": "0x9ABCDEF0"
+      },
+      "iterations": 1000,
+      "first_5_outputs": ["0x50d4784c", "0xf0b90774", "0x7cd6eca6", "0x3e0ffe2d", "0x34fd39c1"],
+      "final_state": {
+        "s1": "0x27ccd9e8",
+        "s2": "0x67abb1c6"
+      },
+      "output_hash_sha256": "466326718f1550191ee60476fb98299c1ad45cbfcdb61d621f83e0a6527323f2"
+    },
+    {
+      "name": "Timestamp seeding test",
+      "description": "Verify timestamp-based seeding for V8 MWC1616",
+      "timestamp_ms": 1389781850000,
+      "expected_seed": {
+        "s1": "0x95741790",
+        "s2": "0x00000143"
+      },
+      "first_output_u16": "0x530c",
+      "notes": "Timestamp from 2014-01-15 12:17:30 UTC (Randstorm vulnerability era)"
+    },
+    {
+      "name": "Historical parity vector 1",
+      "description": "Known vulnerable wallet from Randstorm research",
+      "timestamp_ms": 1389781850000,
+      "engine": "v8",
+      "expected_privkey_hex": "8459259a725f3e05f777dd419c65d816ab58ea1978132a09779f9cad70cf44b7",
+      "notes": "CPU Golden Reference validation vector"
+    }
+  ]
+}

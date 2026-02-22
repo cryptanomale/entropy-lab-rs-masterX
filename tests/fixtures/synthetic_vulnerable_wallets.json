@@ -1,0 +1,149 @@
+[
+  {
+    "name": "Low Entropy Seed - Timestamp Based",
+    "description": "Wallet generated with simple timestamp seed (common 2013 pattern)",
+    "seed": 1366070400000,
+    "timestamp_ms": 1366070400000,
+    "fingerprint": {
+      "user_agent": "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.31 (KHTML, like Gecko) Chrome/26.0.1410.64 Safari/537.31",
+      "screen_width": 1366,
+      "screen_height": 768,
+      "color_depth": 24,
+      "timezone_offset": -300,
+      "language": "en-US",
+      "platform": "Win32"
+    },
+    "expected_behavior": {
+      "should_detect": true,
+      "confidence": "HIGH",
+      "reason": "Common 2013 configuration with timestamp-based seed"
+    },
+    "notes": "Most common vulnerable pattern: Chrome 26, Windows 7, 1366x768 resolution, April 2013"
+  },
+  {
+    "name": "Chrome 25 - Popular Configuration",
+    "description": "Second most common vulnerable configuration from 2013",
+    "seed": 1360281600000,
+    "timestamp_ms": 1360281600000,
+    "fingerprint": {
+      "user_agent": "Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.22 (KHTML, like Gecko) Chrome/25.0.1364.172 Safari/537.22",
+      "screen_width": 1920,
+      "screen_height": 1080,
+      "color_depth": 32,
+      "timezone_offset": 0,
+      "language": "en-GB",
+      "platform": "Win32"
+    },
+    "expected_behavior": {
+      "should_detect": true,
+      "confidence": "HIGH",
+      "reason": "Chrome 25 (early 2013), popular 1080p configuration"
+    },
+    "notes": "High-end configuration for 2013 era, GMT timezone"
+  },
+  {
+    "name": "Edge Case - Zero Seed",
+    "description": "Edge case testing: seed value of 0",
+    "seed": 0,
+    "timestamp_ms": 0,
+    "fingerprint": {
+      "user_agent": "Mozilla/5.0 (Windows NT 6.1) AppleWebKit/537.1 (KHTML, like Gecko) Chrome/21.0.1180.89 Safari/537.1",
+      "screen_width": 1024,
+      "screen_height": 768,
+      "color_depth": 24,
+      "timezone_offset": -480,
+      "language": "en-US",
+      "platform": "Win32"
+    },
+    "expected_behavior": {
+      "should_detect": true,
+      "confidence": "MEDIUM",
+      "reason": "Edge case: zero seed (unlikely but possible)"
+    },
+    "notes": "Tests scanner behavior with minimal seed value"
+  },
+  {
+    "name": "Chrome 14 - Earliest Vulnerable Version",
+    "description": "Earliest Chrome version with MWC1616 vulnerability",
+    "seed": 1317427200000,
+    "timestamp_ms": 1317427200000,
+    "fingerprint": {
+      "user_agent": "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/535.1 (KHTML, like Gecko) Chrome/14.0.835.202 Safari/535.1",
+      "screen_width": 1280,
+      "screen_height": 1024,
+      "color_depth": 32,
+      "timezone_offset": -420,
+      "language": "en-US",
+      "platform": "Win32"
+    },
+    "expected_behavior": {
+      "should_detect": true,
+      "confidence": "HIGH",
+      "reason": "Earliest vulnerable Chrome version (Oct 2011)"
+    },
+    "notes": "October 2011 timestamp - beginning of vulnerability window"
+  },
+  {
+    "name": "Chrome 45 - Latest Vulnerable Version",
+    "description": "Latest Chrome version before MWC1616 was replaced",
+    "seed": 1441065600000,
+    "timestamp_ms": 1441065600000,
+    "fingerprint": {
+      "user_agent": "Mozilla/5.0 (Windows NT 6.3; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/45.0.2454.101 Safari/537.36",
+      "screen_width": 1920,
+      "screen_height": 1080,
+      "color_depth": 24,
+      "timezone_offset": -240,
+      "language": "en-US",
+      "platform": "Win32"
+    },
+    "expected_behavior": {
+      "should_detect": true,
+      "confidence": "HIGH",
+      "reason": "Last vulnerable Chrome version (Sept 2015)"
+    },
+    "notes": "September 2015 - end of vulnerability window, Windows 8.1"
+  },
+  {
+    "name": "Non-Vulnerable - Modern Chrome",
+    "description": "Control test: Modern Chrome should NOT be detected",
+    "seed": 1700000000000,
+    "timestamp_ms": 1700000000000,
+    "fingerprint": {
+      "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+      "screen_width": 1920,
+      "screen_height": 1080,
+      "color_depth": 24,
+      "timezone_offset": -300,
+      "language": "en-US",
+      "platform": "Win64"
+    },
+    "expected_behavior": {
+      "should_detect": false,
+      "confidence": "N/A",
+      "reason": "Modern Chrome (2023) - NOT vulnerable"
+    },
+    "notes": "Negative test case - should NOT trigger vulnerability detection"
+  },
+  {
+    "name": "High Resolution - 2014 Configuration",
+    "description": "Higher-end 2014 configuration",
+    "seed": 1388534400000,
+    "timestamp_ms": 1388534400000,
+    "fingerprint": {
+      "user_agent": "Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/31.0.1650.63 Safari/537.36",
+      "screen_width": 2560,
+      "screen_height": 1440,
+      "color_depth": 32,
+      "timezone_offset": -480,
+      "language": "en-US",
+      "platform": "Win32"
+    },
+    "expected_behavior": {
+      "should_detect": true,
+      "confidence": "HIGH",
+      "reason": "Chrome 31 (Jan 2014), high-end 1440p monitor"
+    },
+    "notes": "January 2014, Windows 8, PST timezone"
+  }
+]

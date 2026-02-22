@@ -1,0 +1,70 @@
+{
+  "workflow_name": "document-project",
+  "workflow_version": "1.2.0",
+  "mode": "full_rescan",
+  "scan_level": "deep",
+  "status": "in_progress",
+  "timestamps": {
+    "started": "2025-12-23T02:43:00Z",
+    "last_updated": "2025-12-23T02:55:00Z"
+  },
+  "project_classification": {
+    "primary_type": "cli",
+    "secondary_type": "library",
+    "tertiary_type": "gpu_accelerated",
+    "project_type_ids": [
+      "cli",
+      "library"
+    ],
+    "confidence": "high"
+  },
+  "project_metadata": {
+    "name": "temporal-planetarium",
+    "display_name": "Temporal Planetarium",
+    "version": "0.1.0",
+    "language": "Rust",
+    "edition": "2021",
+    "min_rust_version": "1.70"
+  },
+  "scan_results": {
+    "structure": "workspace",
+    "crates": [
+      "temporal-planetarium-lib",
+      "temporal-planetarium-cli"
+    ],
+    "source_files": {
+      "rust_files": 45,
+      "opencl_kernels": 46,
+      "test_files": 25,
+      "total_lines": 20000
+    },
+    "features_detected": {
+      "default": true,
+      "gpu": true,
+      "gui": true,
+      "z3-solver": true
+    }
+  },
+  "completed_steps": [
+    {
+      "step": "step_1",
+      "status": "completed",
+      "timestamp": "2025-12-23T02:50:00Z",
+      "summary": "Project re-classified as Rust Workspace with lib and cli crates"
+    },
+    {
+      "step": "step_2",
+      "status": "completed",
+      "timestamp": "2025-12-23T02:52:00Z",
+      "summary": "Existing documentation inventory updated"
+    }
+  ],
+  "current_step": "step_3",
+  "generated_files": [
+    "/Users/moe/temporal-planetarium/_bmad-output/project-scan-report.json"
+  ],
+  "findings": {
+    "project_classification": "Rust Workspace containing `temporal-planetarium-lib` (core logic) and `temporal-planetarium-cli` (CLI interface).",
+    "technology_stack": "Rust 2021, OpenCL, Bitcoin-rust, Secp256k1, Z3 (optional), egui (optional)."
+  }
+}
