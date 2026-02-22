@@ -1,0 +1,272 @@
+# Sprint Status Tracking
+# Generated: 2025-12-25
+# Project: temporal-planetarium
+# Tracking System: file-system
+# Story Location: _bmad-output/implementation-artifacts/stories
+
+# STATUS DEFINITIONS:
+# ==================
+# Epic Status:
+#   - backlog: Epic not yet started
+#   - in-progress: Epic actively being worked on
+#   - done: All stories in epic completed
+#
+# Story Status:
+#   - backlog: Story only exists in epic file
+#   - ready-for-dev: Story file created in stories folder
+#   - in-progress: Developer actively working on implementation
+#   - review: Ready for code review
+#   - done: Story completed
+#
+# Retrospective Status:
+#   - optional: Can be completed but not required
+#   - done: Retrospective has been completed
+
+generated: 2025-12-25
+project: temporal-planetarium
+tracking_system: file-system
+story_location: "_bmad-output/implementation-artifacts/stories"
+
+# =============================================================================
+# LEGACY COMPLETED WORK (Pre-epics.md structure)
+# These epics used different numbering and are preserved for historical tracking
+# =============================================================================
+
+legacy_development_status:
+  # EPIC-001: Randstorm Scanner Enhancement & Validation - COMPLETED
+  epic-001: done
+  001-001-generate-controlled-test-vectors: done
+  001-002-validate-dual-seeding-behavior: done
+  001-003-document-rc4-state-dependency: done
+  001-004-implement-lfsr-seed-generation-model: done
+  001-005-integrate-z3-theorem-prover: done
+  001-006-add-firefox-spidermonkey-prng: done
+  001-007-create-attack-complexity-estimator: done
+  epic-001-retrospective: done
+
+  # EPIC-002: CryptoDeepTools Integration - COMPLETED
+  epic-002: done
+  002-001-shared-test-vector-suite: done
+  002-002-python-pseudocode-documentation: done
+  002-003-performance-comparison-benchmark: done
+  002-004-modular-tool-export-library-crate: done
+  002-005-python-bindings-pyo3: done
+  epic-002-retrospective: done
+
+  # EPIC-003: GPU Bloom Filter Integration - COMPLETED
+  epic-003: done
+  003-001-implement-opencl-blocked-bloom-filter: done
+  003-002-benchmark-bloom-filter-vs-linear: done
+  003-003-integrate-bloom-filter-randstorm: done
+  epic-003-retrospective: optional
+
+  # EPIC-004: Multi-Path Derivation Batcher - COMPLETED
+  epic-004: done
+  004-001-create-derivation-batcher-module: done
+  004-002-implement-gpu-hmac-sha512-batching: done
+  004-003-extend-cli-path-coverage: done
+  004-004-validate-multi-path-derivation-parity: done
+  epic-004-retrospective: optional
+
+  # EPIC-005: Automated Parity Suite - COMPLETED
+  epic-005: done
+  005-001-generate-10000-test-vectors: done
+  005-002-create-validate-parity-script: done
+  005-003-integrate-parity-check-ci: done
+  epic-005-retrospective: optional
+
+  # EPIC-006: Trust Wallet Vulnerability - COMPLETED
+  epic-006: done
+  006-001-trust-wallet-browser-extension-scanner: done
+  epic-006-retrospective: optional
+
+  # EPIC-007: Vulnerability Intelligence Database - IN PROGRESS (legacy)
+  epic-007-legacy: in-progress
+  007-001-target-address-database: done
+  007-002-milk-sad-integration: done
+  007-003-brainwallet-dictionary-import: done
+  007-004-nonce-reuse-detection: done
+  epic-007-legacy-retrospective: optional
+
+  # EPIC-008: Native GPU Modernization (wgpu) - IN PROGRESS (legacy)
+  epic-008-legacy: in-progress
+  008-001-port-core-kernels-wgsl: done
+  008-002-integrate-wgpu-randstorm: done
+  008-003-verify-mac-metal-performance: backlog
+  epic-008-legacy-retrospective: optional
+
+# =============================================================================
+# CURRENT DEVELOPMENT STATUS (From epics.md - Phase 1 MVP + Phase 13)
+# New epic structure for comprehensive Randstorm/BitcoinJS Scanner
+# RECONCILED: 2025-12-25 - Legacy work mapped to current epic structure
+# =============================================================================
+
+development_status:
+  # Epic 1: Core Scanning Engine (Phase 1 MVP)
+  epic-1: in-progress
+  1-1-mwc1616-prng-implementation: review
+  1-2-arc4-key-derivation-pipeline: backlog
+  1-3-p2pkh-address-generation: backlog
+  1-4-opencl-gpu-kernel-implementation: backlog
+  1-5-cpu-fallback-implementation: backlog
+  1-6-scan-result-data-contract-v1: backlog
+  1-7-privatekey-security-wrapper: backlog
+  epic-1-retrospective: optional
+
+  # Epic 2: Browser Fingerprint Intelligence (Phase 1 MVP)
+  epic-2: backlog
+  2-1-browser-fingerprint-schema: backlog
+  2-2-top-100-fingerprint-database: backlog
+  2-3-market-share-prioritization: backlog
+  2-4-fingerprint-database-override: backlog
+  2-5-browser-hint-filtering: backlog
+  epic-2-retrospective: optional
+
+  # Epic 3: CLI Interface & Batch Processing (Phase 1 MVP)
+  epic-3: backlog
+  3-1-cli-command-structure: backlog
+  3-2-target-address-input: backlog
+  3-3-scan-options-configuration: backlog
+  3-4-progress-reporting: backlog
+  3-5-results-output-formatting: backlog
+  3-6-error-handling-strictness: backlog
+  3-7-streaming-large-batch-support: backlog
+  epic-3-retrospective: optional
+
+  # Epic 4: Release Certification & Validation (Phase 1 MVP)
+  epic-4: backlog
+  4-1-randstorm-test-vector-suite: backlog
+  4-2-gpu-cpu-parity-verification: backlog
+  4-3-performance-benchmarks: backlog
+  4-4-regression-test-suite: backlog
+  4-5-false-positive-negative-validation: backlog
+  4-6-deterministic-build-reproducibility: backlog
+  epic-4-retrospective: optional
+
+  # Epic 5: Ethical Framework & Documentation (Parallel Track)
+  epic-5: backlog
+  5-1-security-md-legal-warnings: backlog
+  5-2-responsible-disclosure-protocol: backlog
+  5-3-findings-report-template: backlog
+  5-4-exchange-notification-templates: backlog
+  5-5-client-facing-vulnerability-guide: backlog
+  5-6-audit-trail-implementation: backlog
+  epic-5-retrospective: optional
+
+  # Epic 6: Target Intelligence Infrastructure (Phase 13)
+  # RECONCILED from legacy EPIC-007 (Vulnerability Intelligence Database)
+  epic-6: in-progress
+  6-1-sqlite-target-database: done          # ← Legacy 007-001 (SQLite schema, indexes, bulk ops)
+  6-2-database-import-cli: in-progress      # ← Legacy 007-001 partial (db_path exists, CLI deferred)
+  6-3-milk-sad-integration: done            # ← Legacy 007-002 (MSB extraction, BIP44/49/84, DB persist)
+  6-4-nonce-reuse-forensics: done           # ← Legacy 007-004 (R-value detection, key recovery, AES-256-GCM)
+  6-5-brainwallet-scanner: done             # ← Legacy 007-003 (SecLists ingestion, gzip, benchmarks)
+  6-6-vulnerability-class-isolation: backlog # ← NEW - not covered by legacy work
+  epic-6-retrospective: optional
+
+  # Epic 7: Cross-Platform GPU via WGPU (Phase 13)
+  # RECONCILED from legacy EPIC-008 (Native GPU Modernization)
+  epic-7: in-progress
+  7-1-wgsl-mwc1616-kernel-port: done        # ← Legacy 008-001 (PRNG in randstorm.wgsl)
+  7-2-wgsl-sha256-kernel-port: done         # ← Legacy 008-001 (SHA256 + K constant fixes)
+  7-3-wgsl-ripemd160-kernel-port: done      # ← Legacy 008-001 (RIPEMD160 80-round rewrite)
+  7-4-wgpu-backend-integration: done        # ← Legacy 008-002 (Backend selection, Metal verified)
+  7-5-wgpu-opencl-parity-ci-gate: in-progress  # ← Legacy 008-002 partial (parity verified, CI gate pending)
+  7-6-apple-silicon-performance-optimization: backlog  # ← Legacy 008-003 (pending)
+  epic-7-retrospective: optional
+
+# =============================================================================
+# METRICS & SUMMARY (RECONCILED 2025-12-25)
+# =============================================================================
+
+metrics:
+  # Legacy (completed work - preserved for audit trail)
+  legacy_epics: 8
+  legacy_stories: 34
+  legacy_done: 33
+  legacy_remaining: 1
+  legacy_completion: 97%
+
+  # Current (new epics.md structure - RECONCILED with legacy)
+  current_epics: 7
+  current_stories: 43
+  current_done: 8           # ← 4 from Epic 6 + 4 from Epic 7 (mapped from legacy)
+  current_in_progress: 2    # ← 6-2, 7-5 (partial legacy coverage)
+  current_remaining: 33     # ← 43 - 8 done - 2 in-progress
+  current_completion: 19%   # ← (8/43) * 100
+
+  # Phase 1 MVP (Epics 1-5) - NOT YET STARTED
+  phase1_epics: 5
+  phase1_stories: 31
+  phase1_done: 0
+  phase1_remaining: 31
+  phase1_completion: 0%
+
+  # Phase 13 Advanced (Epics 6-7) - MOSTLY COMPLETE
+  phase13_epics: 2
+  phase13_stories: 12
+  phase13_done: 8
+  phase13_in_progress: 2
+  phase13_remaining: 2
+  phase13_completion: 67%   # ← (8/12) * 100
+
+  # Combined (unique work - no double counting)
+  total_active_epics: 7
+  total_active_stories: 43
+  total_done: 8
+  total_in_progress: 2
+  total_remaining: 33
+  overall_completion: 19%
+
+# =============================================================================
+# NOTES
+# =============================================================================
+
+notes: |
+  SPRINT 1 STARTED - Updated 2025-12-25
+
+  CURRENT SPRINT: Epic 1 - Core Scanning Engine
+  - Story 1-1: MWC1616 PRNG Implementation - READY FOR DEV
+  - Story file: stories/1-1-mwc1616-prng-implementation.md
+
+  This file tracks two development tracks with RECONCILED statuses:
+
+  1. LEGACY (legacy_development_status):
+     - Original EPIC-001 through EPIC-008 from prior sprints
+     - 97% complete (33/34 stories done)
+     - Preserved for historical tracking and audit trail
+     - Story files in stories/ folder use legacy numbering (6-1, 7-1, etc.)
+
+  2. CURRENT (development_status):
+     - New 7-epic structure from epics.md
+     - Phase 1 MVP (Epics 1-5) + Phase 13 (Epics 6-7)
+     - 43 stories with detailed acceptance criteria
+     - **RECONCILED**: Legacy work mapped to current epic structure
+
+  RECONCILIATION SUMMARY (2025-12-25):
+
+  Epic 6 (Target Intelligence) ← Legacy EPIC-007:
+  - 6-1-sqlite-target-database: DONE ← 007-001 (SQLite schema, indexes, bulk ops)
+  - 6-2-database-import-cli: IN-PROGRESS ← 007-001 partial (CLI deferred)
+  - 6-3-milk-sad-integration: DONE ← 007-002 (MSB extraction, BIP44/49/84)
+  - 6-4-nonce-reuse-forensics: DONE ← 007-004 (R-value detection, AES-256-GCM)
+  - 6-5-brainwallet-scanner: DONE ← 007-003 (SecLists ingestion, benchmarks)
+  - 6-6-vulnerability-class-isolation: BACKLOG (new functionality)
+
+  Epic 7 (Cross-Platform GPU) ← Legacy EPIC-008:
+  - 7-1-wgsl-mwc1616-kernel-port: DONE ← 008-001 (PRNG in randstorm.wgsl)
+  - 7-2-wgsl-sha256-kernel-port: DONE ← 008-001 (SHA256 + K constant fixes)
+  - 7-3-wgsl-ripemd160-kernel-port: DONE ← 008-001 (80-round rewrite)
+  - 7-4-wgpu-backend-integration: DONE ← 008-002 (Backend selection, Metal)
+  - 7-5-wgpu-opencl-parity-ci-gate: IN-PROGRESS ← 008-002 partial (CI pending)
+  - 7-6-apple-silicon-performance-optimization: BACKLOG ← 008-003
+
+  IMPACT:
+  - Phase 13 (Epics 6-7): 67% complete (8/12 done, 2 in-progress)
+  - Phase 1 MVP (Epics 1-5): 0% complete (31 stories in backlog)
+  - Overall: 19% complete (8/43 done)
+
+  NEXT STEPS:
+  1. Begin Sprint 1 with Epic 1 (Core Scanning Engine)
+  2. Run Epic 5 (Ethics) in parallel from Sprint 1
+  3. Complete remaining Epic 6/7 stories as capacity allows

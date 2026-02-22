@@ -1,0 +1,3 @@
+# ignore binaries
+bx_seed_walker_bip39_mnemonic
+bx_seed_walker_bip39_mnemonic_*bit

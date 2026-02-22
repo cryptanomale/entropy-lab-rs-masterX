@@ -1,0 +1,24 @@
+# Test Hashes for Module 30501 (Milk Sad)
+
+# Format: $milksad$<purpose>$<timestamp>$<address>
+# Purpose: 44 (P2PKH), 49 (P2SH-P2WPKH), 84 (P2WPKH)
+# Timestamp: Unix timestamp (10 digits)
+# Address: Bitcoin address matching the purpose
+
+# Test 1: P2SH-P2WPKH (purpose 49)
+$milksad$49$1514764800$3HERnjC6RDwg6UYx1hHiAKUp6gz1217h2U
+
+# Test 2: P2PKH (purpose 44)
+$milksad$44$1514764800$1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa
+
+# Test 3: P2WPKH (purpose 84)
+$milksad$84$1514764800$bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
+
+# Test 4: Different timestamp, P2SH
+$milksad$49$1609459200$3J98t1WpEZ73CNmYviecrnyiWrnqRhWNLy
+
+# Test 5: Edge case - minimum timestamp
+$milksad$44$1293840000$1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2
+
+# Test 6: Edge case - maximum timestamp
+$milksad$49$1704067199$3KcP7Ni3pjVJf1QFkFMNfxWDcSFgHVCU8u

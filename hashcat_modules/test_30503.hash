@@ -1,0 +1,19 @@
+# Test Hashes for Module 30503 (Cake Wallet)
+
+# Format: $cakewallet$<address>
+# Address: P2WPKH (bc1q...) address only
+
+# Test 1: Standard P2WPKH
+$cakewallet$bc1q34aq5drpuwy3wgl9lhup9892qp6svr8ldzyy7c
+
+# Test 2: Another P2WPKH
+$cakewallet$bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4
+
+# Test 3: Different address
+$cakewallet$bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq
+
+# Test 4: Genesis block address equivalent (if P2WPKH)
+$cakewallet$bc1q34aq5drpuwy3wgl9lhup9892qp6svr8ldzyy7c
+
+# Test 5: Random valid P2WPKH
+$cakewallet$bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3

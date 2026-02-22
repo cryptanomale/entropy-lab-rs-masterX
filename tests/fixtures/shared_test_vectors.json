@@ -1,0 +1,34 @@
+[
+    {
+        "vulnerability": "randstorm",
+        "engine": "v8",
+        "timestamp_ms": 1366027200000,
+        "seed": null,
+        "expected_address": "167WreEAdFmSpNpxvYsnYfFm3u51F6F2Gj",
+        "expected_privkey": "5K767C7x5XoUnJ9UnK9X"
+    },
+    {
+        "vulnerability": "randstorm",
+        "engine": "java",
+        "timestamp_ms": 1366027200000,
+        "seed": null,
+        "expected_address": "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa",
+        "expected_privkey": null
+    },
+    {
+        "vulnerability": "trust-wallet",
+        "engine": "mt19937",
+        "timestamp_ms": 1680000000000,
+        "seed": 12345,
+        "expected_address": "1BYHq1N3q5X5XqX5XqX5PRNGTEST",
+        "expected_privkey": null
+    },
+    {
+        "vulnerability": "milk-sad",
+        "engine": "mt19937",
+        "timestamp_ms": 1693526400000,
+        "seed": 2049,
+        "expected_address": "12iBrqVPpQ2oNeDgJu1F8RtoH1TsD1brU2",
+        "expected_privkey": "C327FAC63DB7E0CCD1706C03EB5BE0DB2AB3E37A451B84054100D85F314E0F8B"
+    }
+]

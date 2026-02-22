@@ -1,0 +1,24 @@
+# Test Hashes for Module 30502 (Trust Wallet)
+
+# Format: $trustwallet$<purpose>$<timestamp>$<address>
+# Purpose: 44 (P2PKH), 49 (P2SH-P2WPKH), 84 (P2WPKH)
+# Timestamp: Unix timestamp (Nov 14-23, 2022)
+# Address: Bitcoin address matching the purpose
+
+# Test 1: P2SH-P2WPKH (purpose 49)
+$trustwallet$49$1668384000$3JvL6Ymt8MVWiCNHC7oWU6nLeHNJKLZGLN
+
+# Test 2: P2PKH (purpose 44)
+$trustwallet$44$1668384000$1JvL6Ymt8MVWiCNHC7oWU6nLeHNJKLZGLN
+
+# Test 3: P2WPKH (purpose 84)
+$trustwallet$84$1668384000$bc1q34aq5drpuwy3wgl9lhup9892qp6svr8ldzyy7c
+
+# Test 4: Mid-range timestamp
+$trustwallet$49$1668816000$3NukJ6fYZJ5Kk8bPjycAnruZkE5Q7UW7i8
+
+# Test 5: Edge case - first day
+$trustwallet$44$1668384000$1EYTGtG4LnFfiMvjJdsU7GMGCQvsRSjYhx
+
+# Test 6: Edge case - last day
+$trustwallet$84$1669247999$bc1qar0srrr7xfkvy5l643lydnw9re59gtzzwf5mdq
