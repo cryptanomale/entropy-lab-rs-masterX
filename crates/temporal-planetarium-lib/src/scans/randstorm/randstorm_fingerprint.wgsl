@@ -46,13 +46,9 @@ struct MatchResult {
 @group(0) @binding(4) var<storage, read_write> result_count: array<atomic<u32>>;
 
 // ── Bloom filter check ───────────────────────────────────────
-// Probes BLOOM_NUM_HASHES=15 positions using double-hashing:
-//   bit_pos(k) = (h1 + k * h2) % n_bits
-// where h1 = murmur3(data, SEED), h2 = murmur3(data, h1)
 const BLOOM_NUM_HASHES: u32 = 15u;
 const BLOOM_HASH_SEED:  u32 = 0x9E3779B9u;
 
-// MurmurHash3-style hash of 20-byte hash160 (5 x u32) with given seed
 fn bloom_murmur(seed: u32, a0:u32, a1:u32, a2:u32, a3:u32, a4:u32) -> u32 {
     var h = seed;
     var k: u32;
@@ -66,13 +62,13 @@ fn bloom_murmur(seed: u32, a0:u32, a1:u32, a2:u32, a3:u32, a4:u32) -> u32 {
     h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
     k = a4 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
     h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
-    h ^= 20u;  // length = 20 bytes
+    h ^= 20u;
     h ^= (h >> 16u); h *= 0x85EBCA6Bu; h ^= (h >> 13u); h *= 0xC2B2AE35u; h ^= (h >> 16u);
     return h;
 }
 
 fn bloom_check(h0: u32, h1: u32, h2: u32, h3: u32, h4: u32) -> bool {
-    let n = params.bloom_size * 32u;  // bloom_size в u32 словах, биты = слова * 32
+    let n = params.bloom_size * 32u;
     if n == 0u { return true; }
     let bh1 = bloom_murmur(BLOOM_HASH_SEED, h0, h1, h2, h3, h4);
     let bh2 = bloom_murmur(bh1,            h0, h1, h2, h3, h4);
@@ -643,14 +639,20 @@ fn jac_to_affine_ec(p:JacPt)->array<U256,2>{
     let zi=fp_inv_ec(p.z);let zi2=fp_sqr_ec(zi);let zi3=fp_mul_ec(zi2,zi);
     r[0]=from_mont_ec(fp_mul_ec(p.x,zi2));r[1]=from_mont_ec(fp_mul_ec(p.y,zi3));return r;}
 
+// Convert 32-byte big-endian byte array (stored as 32 x u32 bytes) to U256.
+// Each group of 4 consecutive bytes forms one big-endian u32 word.
+// The loop is unrolled with constant indices because WGSL/naga forbids
+// dynamic indexing of function-scope arrays passed by value.
 fn u256_from_bytes32(b: array<u32, 32>) -> U256 {
-    var k = u256z();
-    for (var wi = 0u; wi < 8u; wi++) {
-        let byte_idx = wi * 4u;
-        let word = (b[byte_idx]<<24u)|(b[byte_idx+1u]<<16u)|(b[byte_idx+2u]<<8u)|b[byte_idx+3u];
-        sw_u(&k, wi, word);
-    }
-    return k;
+    let w0 = (b[ 0]<<24u)|(b[ 1]<<16u)|(b[ 2]<<8u)|b[ 3];
+    let w1 = (b[ 4]<<24u)|(b[ 5]<<16u)|(b[ 6]<<8u)|b[ 7];
+    let w2 = (b[ 8]<<24u)|(b[ 9]<<16u)|(b[10]<<8u)|b[11];
+    let w3 = (b[12]<<24u)|(b[13]<<16u)|(b[14]<<8u)|b[15];
+    let w4 = (b[16]<<24u)|(b[17]<<16u)|(b[18]<<8u)|b[19];
+    let w5 = (b[20]<<24u)|(b[21]<<16u)|(b[22]<<8u)|b[23];
+    let w6 = (b[24]<<24u)|(b[25]<<16u)|(b[26]<<8u)|b[27];
+    let w7 = (b[28]<<24u)|(b[29]<<16u)|(b[30]<<8u)|b[31];
+    return u256w(w0, w1, w2, w3, w4, w5, w6, w7);
 }
 
 fn privkey_to_hash160(prng_out: array<u32, 32>) -> array<u32, 5> {
@@ -701,7 +703,6 @@ fn randstorm_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if fp_idx >= params.fp_count { return; }
 
-    // u64 timestamp offset (mulhi чтобы не было u32 overflow)
     let offset_lo = ts_idx * params.interval_ms;
     let ts_idx_lo16 = ts_idx & 0xFFFFu;
     let ts_idx_hi16 = ts_idx >> 16u;
