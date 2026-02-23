@@ -245,7 +245,6 @@ impl RandstormScanner {
                     warn!("\u{26a0}\u{fe0f}  WGPU MODE: ECC/Hashing not yet fully implemented in WGSL (Epic 3).");
                 }
 
-                // Build bloom bytes from address hashes
                 let bloom_bytes = {
                     use crate::utils::gpu_bloom_filter::{compute_bloom_bits, GpuBloomConfig};
                     let bloom_cfg = GpuBloomConfig {
@@ -256,10 +255,8 @@ impl RandstormScanner {
                     compute_bloom_bits(&address_hashes, bloom_cfg.calculate_filter_size(), 15)
                 };
 
-                // Derive timestamp range from batch fingerprints
-                let start_ms = batch.iter().map(|fp| fp.timestamp_ms).min().unwrap_or(0);
-                let end_ms   = batch.iter().map(|fp| fp.timestamp_ms).max().unwrap_or(0);
-                // Use the configured scan interval (1 ms for exhaustive, or coarser)
+                let start_ms   = batch.iter().map(|fp| fp.timestamp_ms).min().unwrap_or(0);
+                let end_ms     = batch.iter().map(|fp| fp.timestamp_ms).max().unwrap_or(0);
                 let interval_ms = self.config.scan_mode.interval_ms().min(1_000) as u32;
 
                 match wgpu.sweep(start_ms, end_ms, interval_ms, &bloom_bytes) {
@@ -267,9 +264,7 @@ impl RandstormScanner {
                         total_processed = total_processed.saturating_add(batch.len() as u64);
                         batch_matches   = seed_hits.len();
 
-                        // Map SeedComponents hits → VulnerabilityFinding
                         for seed in seed_hits {
-                            // Use the first matching fingerprint in the batch for metadata
                             let fp_meta = batch.iter()
                                 .find(|fp| fp.timestamp_ms == seed.timestamp_ms)
                                 .cloned()
@@ -289,7 +284,6 @@ impl RandstormScanner {
                                 year_max:              2016,
                             };
 
-                            // Resolve hash160 → address string
                             let matched_addr = if let Some(h160_words) = seed.hash160 {
                                 let mut h160_bytes = [0u8; 20];
                                 for (i, w) in h160_words.iter().enumerate() {
@@ -308,7 +302,7 @@ impl RandstormScanner {
                             info!("\u{1f3af} GPU Hit: {} @ ts={}", matched_addr, seed.timestamp_ms);
 
                             findings.push(VulnerabilityFinding {
-                                address:         matched_addr,
+                                address: matched_addr,
                                 confidence: match phase {
                                     Phase::One   => Confidence::High,
                                     Phase::Two   => Confidence::Medium,
@@ -390,11 +384,9 @@ impl RandstormScanner {
         Ok(findings)
     }
 
-    /// Prepare target addresses for GPU comparison
     fn prepare_target_addresses(&self, addresses: &[String]) -> Result<Vec<Vec<u8>>> {
         use bitcoin::Address;
         use std::str::FromStr;
-
         let mut result: Vec<Vec<u8>> = Vec::with_capacity(addresses.len());
         for addr_str in addresses {
             let address = Address::from_str(addr_str)
@@ -449,7 +441,6 @@ impl RandstormScanner {
     ) -> Result<Vec<VulnerabilityFinding>> {
         use rayon::prelude::*;
         let engine = self.engine;
-
         let findings: Vec<VulnerabilityFinding> = fingerprints
             .par_iter()
             .filter_map(|fp| {
@@ -511,6 +502,7 @@ impl RandstormScanner {
         Ok(Address::p2pkh(&pubkey, Network::Bitcoin))
     }
 
+    /// Convert browser config to seed components (uses prng::SeedComponents — no hash160)
     #[allow(dead_code)]
     fn config_to_seed(&self, config: &BrowserConfig, timestamp: u64) -> SeedComponents {
         SeedComponents {
@@ -522,7 +514,6 @@ impl RandstormScanner {
             timezone_offset: config.timezone_offset,
             language:        config.language.clone(),
             platform:        config.platform.clone(),
-            hash160:         None,
         }
     }
 }
