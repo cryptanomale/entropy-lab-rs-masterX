@@ -46,17 +46,85 @@ struct MatchResult {
 @group(0) @binding(4) var<storage, read_write> result_count: array<atomic<u32>>;
 
 // ── Bloom filter check ───────────────────────────────────────
+// FIX C: must probe exactly BLOOM_NUM_HASHES=15 positions using
+// the same double-hashing as Rust's compute_bloom_bits():
+//   h(k,i) = (h1 + i*h2) % n_bits
+// where h1 = murmur(data, SEED), h2 = murmur(data, h1)
+// Bloom filter buffer stores u32 words (little-endian bits)
+const BLOOM_NUM_HASHES: u32 = 15u;
+const BLOOM_HASH_SEED:  u32 = 0x9E3779B9u;
+
+fn murmur3_u32(seed: u32, extra: u32) -> u32 {
+    // Compact MurmurHash3 finalizer over two u32 words (8 bytes representing hash160 slice)
+    // We feed each 20-byte hash160 through a rolling murmur.
+    // For bloom probe: we pass (seed, extra) as a 2-word message.
+    var h = seed;
+    var k = extra;
+    k = k * 0xCC9E2D51u;
+    k = (k << 15u) | (k >> 17u);
+    k = k * 0x1B873593u;
+    h = h ^ k;
+    h = (h << 13u) | (h >> 19u);
+    h = h * 5u + 0xE6546B64u;
+    h = h ^ 8u;   // length = 8 bytes
+    h = h ^ (h >> 16u);
+    h = h * 0x85EBCA6Bu;
+    h = h ^ (h >> 13u);
+    h = h * 0xC2B2AE35u;
+    h = h ^ (h >> 16u);
+    return h;
+}
+
+// Compute h1 and h2 for a 20-byte hash160 stored as 5 u32s
+fn bloom_h1(a0:u32, a1:u32, a2:u32, a3:u32, a4:u32) -> u32 {
+    var h = BLOOM_HASH_SEED;
+    // Process 5 words (20 bytes) as 4-byte chunks
+    var k: u32;
+    k = a0 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
+    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
+    k = a1 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
+    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
+    k = a2 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
+    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
+    k = a3 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
+    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
+    k = a4 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
+    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
+    h ^= 20u;  // length = 20 bytes
+    h ^= (h >> 16u); h *= 0x85EBCA6Bu; h ^= (h >> 13u); h *= 0xC2B2AE35u; h ^= (h >> 16u);
+    return h;
+}
+
+fn bloom_h2(h1: u32, a0:u32, a1:u32, a2:u32, a3:u32, a4:u32) -> u32 {
+    // h2 = murmur(data, h1) - same data but different seed
+    var h = h1;
+    var k: u32;
+    k = a0 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
+    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
+    k = a1 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
+    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
+    k = a2 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
+    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
+    k = a3 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
+    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
+    k = a4 * 0xCC9E2D51u; k = (k<<15u)|(k>>17u); k *= 0x1B873593u;
+    h ^= k; h = (h<<13u)|(h>>19u); h = h*5u + 0xE6546B64u;
+    h ^= 20u;
+    h ^= (h >> 16u); h *= 0x85EBCA6Bu; h ^= (h >> 13u); h *= 0xC2B2AE35u; h ^= (h >> 16u);
+    return h;
+}
+
 fn bloom_check(h0: u32, h1: u32, h2: u32, h3: u32, h4: u32) -> bool {
-    let n = params.bloom_size * 32u;
+    let n = params.bloom_size * 32u;  // bloom_size is in u32 words, so bits = words * 32
     if n == 0u { return true; }
-    let idx0 = (h0 ^ (h1 << 7u))  % n;
-    let idx1 = (h1 ^ (h2 << 11u)) % n;
-    let idx2 = (h2 ^ (h3 << 13u)) % n;
-    let idx3 = (h3 ^ (h4 << 17u)) % n;
-    let w0 = bloom[idx0 >> 5u]; if ((w0 >> (idx0 & 31u)) & 1u) == 0u { return false; }
-    let w1 = bloom[idx1 >> 5u]; if ((w1 >> (idx1 & 31u)) & 1u) == 0u { return false; }
-    let w2 = bloom[idx2 >> 5u]; if ((w2 >> (idx2 & 31u)) & 1u) == 0u { return false; }
-    let w3 = bloom[idx3 >> 5u]; if ((w3 >> (idx3 & 31u)) & 1u) == 0u { return false; }
+    let bh1 = bloom_h1(h0, h1, h2, h3, h4);
+    let bh2 = bloom_h2(bh1, h0, h1, h2, h3);  // note: h4 not used in h2 seed for compat
+    for (var k = 0u; k < BLOOM_NUM_HASHES; k++) {
+        let bit_pos = (bh1 + k * bh2) % n;
+        let word_idx = bit_pos >> 5u;      // / 32
+        let bit_off  = bit_pos & 31u;      // % 32
+        if ((bloom[word_idx] >> bit_off) & 1u) == 0u { return false; }
+    }
     return true;
 }
 
@@ -64,7 +132,6 @@ fn bloom_check(h0: u32, h1: u32, h2: u32, h3: u32, h4: u32) -> bool {
 fn arc4_ksa(
     ts_lo: u32, ts_hi: u32,
     sw: u32, sh: u32, cd: u32, tz: i32,
-    slot: u32,
     out_s: ptr<function, array<u32, 256>>
 ) {
     let k0  = sw & 0xFFu;
@@ -134,12 +201,6 @@ fn ep1(e: u32) -> u32 { return rotr32(e,6u)  ^ rotr32(e,11u) ^ rotr32(e,25u); }
 fn sig0(x: u32) -> u32 { return rotr32(x,7u) ^ rotr32(x,18u) ^ (x >> 3u); }
 fn sig1(x: u32) -> u32 { return rotr32(x,17u)^ rotr32(x,19u) ^ (x >> 10u); }
 
-// BUG 2 FIX: правильный макрос шага SHA-256.
-// Было: d+=t1; hh=t1+t2; {let tmp=a; a=hh; hh=g; g=f; f=e; e=d; d=c; c=b; b=tmp;}
-// — это делало swap(a,hh) вместо левого вращения всех 8 регистров.
-// Правильно: новый a = T1+T2, новый e = old_d + T1, остальные сдвигаются влево.
-// Реализуем как inline-последовательность без временного массива (naga-safe).
-
 fn sha256_block(
     m00: u32, m01: u32, m02: u32, m03: u32,
     m04: u32, m05: u32, m06: u32, m07: u32,
@@ -204,13 +265,9 @@ fn sha256_block(
     var a=h0i; var b=h1i; var c=h2i; var d=h3i;
     var e=h4i; var f=h5i; var g=h6i; var hh=h7i;
 
-    // FIX 2: правильное вращение 8 регистров.
-    // Каждый раунд: T1 = h+Σ1(e)+Ch(e,f,g)+K+W; T2 = Σ0(a)+Maj(a,b,c)
-    //               h=g; g=f; f=e; e=d+T1; d=c; c=b; b=a; a=T1+T2
     var t1=0u; var t2=0u; var na=0u;
     t1=hh+ep1(e)+ch(e,f,g)+0x428a2f98u+w00; t2=ep0(a)+maj(a,b,c); na=t1+t2; hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=na;
     t1=hh+ep1(e)+ch(e,f,g)+0x71374491u+w01; t2=ep0(a)+maj(a,b,c); na=t1+t2; hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=na;
-    // BUG 1 FIX: 0xb5c0fbef → 0xb5c0fbcf
     t1=hh+ep1(e)+ch(e,f,g)+0xb5c0fbcfu+w02; t2=ep0(a)+maj(a,b,c); na=t1+t2; hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=na;
     t1=hh+ep1(e)+ch(e,f,g)+0xe9b5dba5u+w03; t2=ep0(a)+maj(a,b,c); na=t1+t2; hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=na;
     t1=hh+ep1(e)+ch(e,f,g)+0x3956c25bu+w04; t2=ep0(a)+maj(a,b,c); na=t1+t2; hh=g;g=f;f=e;e=d+t1;d=c;c=b;b=a;a=na;
@@ -280,7 +337,6 @@ fn sha256_block(
     return out;
 }
 
-// SHA-256 32-байтного сообщения
 fn sha256_32(b: array<u32, 32>) -> array<u32, 8> {
     let m00 = (b[ 0]<<24u)|(b[ 1]<<16u)|(b[ 2]<<8u)|b[ 3];
     let m01 = (b[ 4]<<24u)|(b[ 5]<<16u)|(b[ 6]<<8u)|b[ 7];
@@ -298,9 +354,7 @@ fn sha256_32(b: array<u32, 32>) -> array<u32, 8> {
     );
 }
 
-// SHA-256 33-байтного сжатого pubkey (prefix || Qx)
 fn sha256_33(prefix: u32, x0:u32,x1:u32,x2:u32,x3:u32,x4:u32,x5:u32,x6:u32,x7:u32) -> array<u32, 8> {
-    // 33 bytes → 1 block (64 bytes): упаковка со сдвигом на 1 байт
     let w00=(prefix<<24u)|(x0>>8u);
     let w01=(x0<<24u)|(x1>>8u);
     let w02=(x1<<24u)|(x2>>8u);
@@ -309,8 +363,7 @@ fn sha256_33(prefix: u32, x0:u32,x1:u32,x2:u32,x3:u32,x4:u32,x5:u32,x6:u32,x7:u3
     let w05=(x4<<24u)|(x5>>8u);
     let w06=(x5<<24u)|(x6>>8u);
     let w07=(x6<<24u)|(x7>>8u);
-    let w08=(x7<<24u)|0x800000u; // 0x80 padding byte
-    // length = 33*8 = 264 bits = 0x108
+    let w08=(x7<<24u)|0x800000u;
     return sha256_block(
         w00,w01,w02,w03,w04,w05,w06,w07,
         w08,0u,0u,0u,0u,0u,0u,264u,
@@ -454,7 +507,6 @@ fn rmd_word(x0:u32,x1:u32,x2:u32,x3:u32,x4:u32,x5:u32,x6:u32,x7:u32,
 }
 
 fn ripemd160_32(sha_out: array<u32, 8>) -> array<u32, 5> {
-    // big-endian SHA-256 word → little-endian RIPEMD-160 word (bswap)
     let x0 = ((sha_out[0]&0xFFu)<<24u)|((sha_out[0]>>8u&0xFFu)<<16u)|((sha_out[0]>>16u&0xFFu)<<8u)|(sha_out[0]>>24u);
     let x1 = ((sha_out[1]&0xFFu)<<24u)|((sha_out[1]>>8u&0xFFu)<<16u)|((sha_out[1]>>16u&0xFFu)<<8u)|(sha_out[1]>>24u);
     let x2 = ((sha_out[2]&0xFFu)<<24u)|((sha_out[2]>>8u&0xFFu)<<16u)|((sha_out[2]>>16u&0xFFu)<<8u)|(sha_out[2]>>24u);
@@ -465,7 +517,7 @@ fn ripemd160_32(sha_out: array<u32, 8>) -> array<u32, 5> {
     let x7 = ((sha_out[7]&0xFFu)<<24u)|((sha_out[7]>>8u&0xFFu)<<16u)|((sha_out[7]>>16u&0xFFu)<<8u)|(sha_out[7]>>24u);
     let x8  = 0x00000080u;
     let x9  = 0u; let xa = 0u; let xb = 0u; let xc = 0u; let xd = 0u;
-    let xe  = 0x00000100u;  // 256 bits
+    let xe  = 0x00000100u;
     let xf  = 0u;
 
     var a1=0x67452301u; var b1=0xefcdab89u; var c1=0x98badcfeu; var d1=0x10325476u; var e1=0xc3d2e1f0u;
@@ -483,15 +535,6 @@ fn ripemd160_32(sha_out: array<u32, 8>) -> array<u32, 5> {
         a2 = e2; e2 = d2; d2 = (c2<<10u)|(c2>>22u); c2 = b2; b2 = r2 + e2;
     }
 
-    // FIX 3: правильный порядок финализации RIPEMD-160
-    // Стандарт (RFC 2286 / оригинальная спецификация):
-    //   tt = H1 + c1 + d2
-    //   H1 = H2 + d1 + e2
-    //   H2 = H3 + e1 + a2
-    //   H3 = H4 + a1 + b2
-    //   H4 = H0 + b1 + c2
-    //   H0 = tt
-    // где H0..H4 = 0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0
     var h: array<u32, 5>;
     let tt  = 0xefcdab89u + c1 + d2;
     h[0]    = 0x98badcfeu + d1 + e2;
@@ -502,9 +545,7 @@ fn ripemd160_32(sha_out: array<u32, 8>) -> array<u32, 5> {
     return h;
 }
 
-// ── secp256k1: U256 и EC умножение ──────────────────────────
-// (Скопировано из randstorm_full.wgsl — единственный источник истины)
-
+// ── secp256k1 Montgomery arithmetic ─────────────────────────
 const P0:u32=0xFFFFFFFFu;const P1:u32=0xFFFFFFFFu;
 const P2:u32=0xFFFFFFFFu;const P3:u32=0xFFFFFFFFu;
 const P4:u32=0xFFFFFFFFu;const P5:u32=0xFFFFFFFFu;
@@ -515,6 +556,7 @@ const R2_2:u32=0x00000000u;const R2_3:u32=0x00000001u;
 const R2_4:u32=0x000007A2u;const R2_5:u32=0x000E90A1u;
 const R2_6:u32=0x0000E2EEu;const R2_7:u32=0xA9BC4E9Du;
 const MON1_6:u32=0x00000001u;const MON1_7:u32=0x000003D1u;
+// G in Montgomery form (Gx * R mod p, Gy * R mod p)
 const GXM0:u32=0x9981E643u;const GXM1:u32=0xE9089F48u;
 const GXM2:u32=0x979F48C0u;const GXM3:u32=0x33A3D4E5u;
 const GXM4:u32=0x58B0573Du;const GXM5:u32=0x0C5E5B10u;
@@ -644,7 +686,6 @@ fn jac_to_affine_ec(p:JacPt)->array<U256,2>{
     let zi=fp_inv_ec(p.z);let zi2=fp_sqr_ec(zi);let zi3=fp_mul_ec(zi2,zi);
     r[0]=from_mont_ec(fp_mul_ec(p.x,zi2));r[1]=from_mont_ec(fp_mul_ec(p.y,zi3));return r;}
 
-// Строит U256 из 32 сырых байт (big-endian)
 fn u256_from_bytes32(b: array<u32, 32>) -> U256 {
     var k = u256z();
     for (var wi = 0u; wi < 8u; wi++) {
@@ -655,54 +696,51 @@ fn u256_from_bytes32(b: array<u32, 32>) -> U256 {
     return k;
 }
 
-// FIX 4: EC path — privkey → pubkey → hash160
-// Принимает 32 байта приватного ключа, возвращает Hash160 сжатого pubkey
+// privkey → pubkey → hash160
+// FIX B: scalar k is used RAW in double-and-add (not converted to Montgomery).
+// Montgomery form is only for field elements (coordinates), not for the scalar.
 fn privkey_to_hash160(prng_out: array<u32, 32>) -> array<u32, 5> {
-    // Строим скаляр k из байт PRNG (big-endian)
+    // Raw scalar from privkey bytes
     let k = u256_from_bytes32(prng_out);
 
-    // Приводим k в форму Montgomery перед умножением
-    let k_mont = mont_mul_fp(k, fp_r2());
-
-    // Q = k * G
+    // G is already in Montgomery form in our constants
     var G: JacPt;
     G.x = u256w(GXM0,GXM1,GXM2,GXM3,GXM4,GXM5,GXM6,GXM7);
     G.y = u256w(GYM0,GYM1,GYM2,GYM3,GYM4,GYM5,GYM6,GYM7);
     G.z = fp_mont1();
+
+    // Double-and-add using raw scalar bits (not Montgomery-converted k)
     var R = jac_inf();
     var i: i32 = 255;
     loop {
         if (i < 0) { break; }
         let wi = u32(i) / 32u;
         let bi = u32(i) % 32u;
-        let bit = (gw(k_mont, 7u - wi) >> bi) & 1u;
+        // FIX B: read bits from raw k, not k_mont
+        let bit = (gw(k, 7u - wi) >> bi) & 1u;
         R = jac_dbl(R);
         if (bit == 1u) { R = jac_add(R, G); }
         i -= 1;
     }
 
-    // Если k == 0 → возвращаем нули (невалидный ключ)
     if (jac_is_inf(R)) {
         var z: array<u32, 5>;
         return z;
     }
 
-    // Аффинные координаты
     let xy = jac_to_affine_ec(R);
     let Qx = xy[0];
     let Qy = xy[1];
 
-    // Сжатый pubkey: prefix = 0x02 если Qy чётный, 0x03 иначе
+    // Compressed pubkey prefix: 0x02 if Qy even, 0x03 if odd
     let prefix = 2u + (gw(Qy, 7u) & 1u);
 
-    // SHA-256(compressed pubkey 33 bytes)
     let sha_out = sha256_33(
         prefix,
         gw(Qx,0u),gw(Qx,1u),gw(Qx,2u),gw(Qx,3u),
         gw(Qx,4u),gw(Qx,5u),gw(Qx,6u),gw(Qx,7u)
     );
 
-    // RIPEMD-160(SHA-256)
     return ripemd160_32(sha_out);
 }
 
@@ -714,29 +752,45 @@ fn randstorm_main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     if fp_idx >= params.fp_count { return; }
 
-    // Вычисляем timestamp
-    let ts_lo = params.start_ms_lo + ts_idx * params.interval_ms;
-    let ts_hi = params.start_ms_hi + select(0u, 1u, ts_lo < params.start_ms_lo);
+    // FIX A: compute full u64 timestamp offset to avoid u32 overflow.
+    // Old code: ts_lo = start_ms_lo + ts_idx * interval_ms  <- OVERFLOWS for ts_idx > ~1000
+    // Fix: compute offset as u64 split into hi/lo, then add to start.
+    let offset_lo = ts_idx * params.interval_ms;
+    // carry detection: if offset_lo < ts_idx * interval_ms would overflow, but since
+    // WGSL has no u64, we detect carry by checking if offset_lo < (ts_idx & 0xFFFFu) * params.interval_ms
+    // Simpler: use the fact that carry occurs when ts_idx * interval_ms wraps.
+    // We compute carry = (ts_idx >> 16) * interval_ms + (((ts_idx & 0xFFFFu) * interval_ms) >> 16)
+    //                    >> 16  ... this is equivalent to mulhi(ts_idx, interval_ms)
+    let ts_idx_lo16 = ts_idx & 0xFFFFu;
+    let ts_idx_hi16 = ts_idx >> 16u;
+    let mid = ts_idx_lo16 * (params.interval_ms >> 16u) + ts_idx_hi16 * (params.interval_ms & 0xFFFFu);
+    let offset_hi = ts_idx_hi16 * (params.interval_ms >> 16u) + (mid >> 16u) +
+                    (((ts_idx_lo16 * (params.interval_ms & 0xFFFFu)) >> 16u) + (mid & 0xFFFFu)) >> 16u;
 
-    // Загружаем fingerprint
+    // Add offset (hi:lo) to start_ms (hi:lo)
+    let ts_lo_raw = params.start_ms_lo + offset_lo;
+    let carry     = select(0u, 1u, ts_lo_raw < params.start_ms_lo);
+    let ts_lo     = ts_lo_raw;
+    let ts_hi     = params.start_ms_hi + offset_hi + carry;
+
     let fp = fingerprints[fp_idx];
 
-    // ARC4 KSA с fingerprint
+    // ARC4 KSA with fingerprint entropy
     var s: array<u32, 256>;
     arc4_ksa(ts_lo, ts_hi, fp.screen_width, fp.screen_height,
-             fp.color_depth, fp.timezone_offset, gid.x, &s);
+             fp.color_depth, fp.timezone_offset, &s);
 
-    // Генерируем 32 байта приватного ключа
+    // Generate 32 privkey bytes
     var prng_out: array<u32, 32>;
     arc4_prng(&s, &prng_out);
 
-    // FIX 4: правильный путь privkey → EC pubkey → Hash160
+    // privkey → EC pubkey → Hash160
     let h160 = privkey_to_hash160(prng_out);
 
-    // Проверяем bloom filter
+    // Bloom filter check
     if !bloom_check(h160[0], h160[1], h160[2], h160[3], h160[4]) { return; }
 
-    // Записываем результат
+    // Write result
     let idx = atomicAdd(&result_count[0], 1u);
     if idx < 65536u {
         results[idx].timestamp_lo = ts_lo;
