@@ -4,6 +4,13 @@
 //
 // This kernel adds a GPU-resident Bloom filter for target address lookups,
 // enabling efficient scanning against 1M+ target addresses.
+//
+// FIX 3: Removed 0xFFFFFFFF "magic potential hit" value.
+// Previously when num_targets >= 1000 the kernel returned 0xFFFFFFFF for any
+// bloom hit, and the host accepted match_val > 0 as a confirmed match without
+// exact address verification — causing massive false positives.
+// Now always does exact linear hash160 compare regardless of num_targets count.
+// Returns i+1 (1-based exact target index) or 0 (no match).
 
 typedef unsigned char uchar;
 typedef uint uint;
@@ -164,7 +171,7 @@ __kernel void randstorm_check_bloom(
     const uint batch_size,
     __global const uchar *bloom_filter,
     const uint bloom_size_bytes,
-    __global const uchar *target_hashes, // Optional: for second-stage check if N is small
+    __global const uchar *target_hashes,
     const uint num_targets,
     const uint engine_type,
     __global uint *output_matches
@@ -203,37 +210,33 @@ __kernel void randstorm_check_bloom(
     uchar derived_hash[20];
     derive_p2pkh_hash(privkey, derived_hash);
     
-    // 6. Check Bloom Filter
+    // 6. Check Bloom Filter (fast pre-filter)
     uint bloom_size_bits = bloom_size_bytes * 8;
-    uchar hit = 1;
+    uchar bloom_hit = 1;
     for (uint k = 0; k < BLOOM_NUM_HASHES; k++) {
         uint bit_pos = get_hash_k_private(derived_hash, 20, k, bloom_size_bits);
         uint byte_pos = bit_pos / 8;
         uint bit_offset = bit_pos % 8;
         if ((bloom_filter[byte_pos] & (1 << bit_offset)) == 0) {
-            hit = 0; break;
+            bloom_hit = 0; break;
         }
     }
     
-    // 7. If Bloom hit, confirm via linear scan (only if targets provided and small)
-    // Or just report hit to CPU. For now, we report the "hit" status.
-    if (hit) {
-        // Optional second stage for high-precision validation on GPU
-        if (num_targets > 0 && num_targets < 1000) {
-            uint match = 0;
-            for (uint i = 0; i < num_targets; i++) {
-                bool found = true;
-                __global const uchar *target = &target_hashes[i * 20];
-                for (int j = 0; j < 20; j++) {
-                    if (derived_hash[j] != target[j]) { found = false; break; }
-                }
-                if (found) { match = i + 1; break; }
+    // 7. FIX 3: Always do exact linear hash160 compare when bloom hits.
+    // Previously: if num_targets >= 1000 returned 0xFFFFFFFF (magic "potential hit")
+    // causing massive false positives since host accepted any match_val > 0.
+    // Now: always linear scan, always return exact i+1 index or 0.
+    if (bloom_hit && num_targets > 0) {
+        uint match = 0;
+        for (uint i = 0; i < num_targets; i++) {
+            bool found = true;
+            __global const uchar *target = &target_hashes[i * 20];
+            for (int j = 0; j < 20; j++) {
+                if (derived_hash[j] != target[j]) { found = false; break; }
             }
-            output_matches[idx] = match;
-        } else {
-            // Report potential hit (non-zero value)
-            output_matches[idx] = 0xFFFFFFFF; // Magic value for "potential hit"
+            if (found) { match = i + 1; break; }
         }
+        output_matches[idx] = match;
     } else {
         output_matches[idx] = 0;
     }

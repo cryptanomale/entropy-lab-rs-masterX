@@ -52,8 +52,9 @@ impl RandstormScanner {
             .context("Failed to load comprehensive fingerprint database")?;
 
         let mut gpu_scanner = None;
+        // FIX 1: wgpu_scanner must be mut so we can assign the created scanner into it
         #[cfg(feature = "wgpu")]
-        let wgpu_scanner: Option<super::wgpu_integration::WgpuScanner> = None;
+        let mut wgpu_scanner: Option<super::wgpu_integration::WgpuScanner> = None;
 
         use super::config::GpuBackend;
 
@@ -63,11 +64,13 @@ impl RandstormScanner {
                     #[cfg(target_os = "macos")]
                     {
                         #[cfg(feature = "wgpu")]
-                        let mut wgpu_scanner = wgpu_scanner;
-                        #[cfg(feature = "wgpu")]
-                        if let Ok(scanner) = super::wgpu_integration::WgpuScanner::new(config.clone(), engine, None, true) {
-                            info!("\u{2705} Auto-selected WGPU (Metal) backend");
-                            wgpu_scanner = Some(scanner);
+                        match super::wgpu_integration::WgpuScanner::new(config.clone(), engine, None, true) {
+                            Ok(scanner) => {
+                                // FIX 1: was Ok(_scanner) — scanner was dropped immediately
+                                info!("\u{2705} Auto-selected WGPU (Metal) backend");
+                                wgpu_scanner = Some(scanner);
+                            }
+                            Err(e) => warn!("WGPU (Metal) initialization failed: {}", e),
                         }
                         #[cfg(feature = "wgpu")]
                         let wgpu_active = wgpu_scanner.is_some();
@@ -83,18 +86,22 @@ impl RandstormScanner {
                     }
                     #[cfg(not(target_os = "macos"))]
                     {
-                        let mut wgpu_success = false;
                         #[cfg(feature = "wgpu")]
-                        {
-                            match super::wgpu_integration::WgpuScanner::new(config.clone(), engine, None, true) {
-                                Ok(_scanner) => {
-                                    info!("\u{2705} Auto-selected WGPU (Vulkan) backend");
-                                    wgpu_success = true;
-                                }
-                                Err(e) => warn!("WGPU (Vulkan) initialization failed: {}", e),
+                        match super::wgpu_integration::WgpuScanner::new(config.clone(), engine, None, true) {
+                            Ok(scanner) => {
+                                // FIX 1: was Ok(_scanner) — scanner was dropped immediately,
+                                // wgpu_success flag was set but wgpu_scanner remained None.
+                                // Now correctly saved to wgpu_scanner.
+                                info!("\u{2705} Auto-selected WGPU (Vulkan) backend");
+                                wgpu_scanner = Some(scanner);
                             }
+                            Err(e) => warn!("WGPU (Vulkan) initialization failed: {}", e),
                         }
-                        if !wgpu_success {
+                        #[cfg(feature = "wgpu")]
+                        let wgpu_active = wgpu_scanner.is_some();
+                        #[cfg(not(feature = "wgpu"))]
+                        let wgpu_active = false;
+                        if !wgpu_active {
                             #[cfg(feature = "gpu")]
                             match GpuScanner::new(config.clone(), engine, None, true) {
                                 Ok(scanner) => {
@@ -109,7 +116,11 @@ impl RandstormScanner {
                 GpuBackend::Wgpu => {
                     #[cfg(feature = "wgpu")]
                     match super::wgpu_integration::WgpuScanner::new(config.clone(), engine, None, true) {
-                        Ok(_scanner) => info!("\u{2705} Forced WGPU backend enabled"),
+                        Ok(scanner) => {
+                            // FIX 1: was Ok(_scanner) — dropped immediately
+                            info!("\u{2705} Forced WGPU backend enabled");
+                            wgpu_scanner = Some(scanner);
+                        }
                         Err(e) => warn!("Forced WGPU initialization failed: {}", e),
                     }
                     #[cfg(not(feature = "wgpu"))]

