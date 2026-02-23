@@ -38,7 +38,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::str::FromStr;
-use tracing::{info, warn};
+use tracing::info;
 use super::config::{self, GpuBackend};
 
 /// Run the Randstorm scanner with CLI arguments
@@ -130,7 +130,7 @@ pub fn run_scan(
         gpu_backend,
         ..Default::default()
     };
-    
+
     // Handle force flags for backward compatibility
     if force_cpu {
         config.gpu_backend = GpuBackend::Cpu;
@@ -224,7 +224,7 @@ pub fn run_scan(
             ) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
-                    warn!("⚠️  GPU sweep failed ({}), falling back to CPU", e);
+                    tracing::warn!("⚠️  GPU sweep failed ({}), falling back to CPU", e);
                 }
             }
         }
@@ -334,7 +334,7 @@ fn load_addresses_from_csv(path: &Path) -> Result<Vec<String>> {
         if trimmed.starts_with('1') || trimmed.starts_with('3') || trimmed.starts_with("bc1") {
             addresses.push(trimmed.to_string());
         } else {
-            warn!(
+            tracing::warn!(
                 "Line {}: Invalid Bitcoin address format: {}",
                 line_num + 1,
                 trimmed
@@ -414,10 +414,7 @@ fn gpu_direct_sweep_scan(
 ) -> Result<()> {
     use super::wgpu_integration::WgpuScanner;
     use super::fingerprint::BrowserFingerprint;
-    use super::gpu_integration::MatchedKey;
     use crate::utils::gpu_bloom_filter::{compute_bloom_bits, GpuBloomConfig};
-    use sha2::{Sha256, Digest};
-    use ripemd::Ripemd160;
 
     if interval_ms == 0 { anyhow::bail!("interval_ms must be > 0"); }
     if start_ms > end_ms { anyhow::bail!("start_ms must be <= end_ms"); }
@@ -510,8 +507,8 @@ fn gpu_direct_sweep_scan(
 
         if batch.is_empty() { break; }
 
-        // Process on GPU
-        let result = wgpu.process_batch(&batch, &bloom_data)
+        // FIX: added missing third argument &hash160s (E0061)
+        let result = wgpu.process_batch(&batch, &bloom_data, &hash160s)
             .context("GPU batch processing failed")?;
 
         // Verify hits on CPU (bloom filter has false positives)
@@ -599,10 +596,10 @@ fn direct_sweep_scan(
             } else if script.is_p2sh() {
                 target_set.insert(script.as_bytes()[2..22].to_vec());
             } else {
-                warn!("Unsupported address type in sweep mode: {}", addr_str);
+                tracing::warn!("Unsupported address type in sweep mode: {}", addr_str);
             }
         } else {
-            warn!("Invalid address skipped in sweep mode: {}", addr_str);
+            tracing::warn!("Invalid address skipped in sweep mode: {}", addr_str);
         }
     }
 
@@ -754,9 +751,6 @@ mod tests {
     use std::io::Write;
     use tempfile::NamedTempFile;
 
-    // TEST-ID: 1.8.1-UNIT-001
-    // AC: AC-1 (CSV Input Validation)
-    // PRIORITY: P0 (Smoke - must pass)
     #[test]
     fn test_load_addresses_valid_p2pkh() {
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -771,9 +765,6 @@ mod tests {
         assert_eq!(addresses[0], "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa");
     }
 
-    // TEST-ID: 1.8.1-UNIT-002
-    // AC: AC-1 (CSV Input Validation)
-    // PRIORITY: P0
     #[test]
     fn test_load_addresses_mixed_valid_invalid() {
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -783,12 +774,9 @@ mod tests {
         temp_file.flush().unwrap();
 
         let addresses = load_addresses_from_csv(temp_file.path()).unwrap();
-        assert_eq!(addresses.len(), 2); // Only valid ones
+        assert_eq!(addresses.len(), 2);
     }
 
-    // TEST-ID: 1.8.1-UNIT-003
-    // AC: AC-1 (CSV Input Validation)
-    // PRIORITY: P1
     #[test]
     fn test_load_addresses_comments_and_empty() {
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -804,9 +792,6 @@ mod tests {
         assert_eq!(addresses.len(), 2);
     }
 
-    // TEST-ID: 1.8.1-UNIT-004
-    // AC: AC-1 (CSV Input Validation)
-    // PRIORITY: P1
     #[test]
     fn test_load_addresses_file_not_found() {
         let result = load_addresses_from_csv(Path::new("/nonexistent/file.csv"));
@@ -815,9 +800,6 @@ mod tests {
         assert!(err_msg.contains("Failed to open CSV file"));
     }
 
-    // TEST-ID: 1.8.1-UNIT-005
-    // AC: AC-1 (CSV Input Validation)
-    // PRIORITY: P1
     #[test]
     fn test_load_addresses_whitespace_only() {
         let mut temp_file = NamedTempFile::new().unwrap();
@@ -839,26 +821,16 @@ mod tests {
         assert_eq!(format_confidence(&Confidence::Low), "LOW");
     }
 
-    // TEST-ID: 1.8.1-UNIT-006
-    // AC: AC-2 (CSV Output Format)
-    // PRIORITY: P0
     #[test]
     fn test_output_results_header() {
-        use super::super::fingerprints::BrowserConfig;
-        use super::super::integration::{Confidence, VulnerabilityFinding};
+        use super::super::integration::VulnerabilityFinding;
         let results: Vec<VulnerabilityFinding> = vec![];
         let mut output = Vec::new();
-
         output_results_to_writer(&results, &mut output).unwrap();
         let output_str = String::from_utf8(output).unwrap();
-
-        assert!(output_str
-            .starts_with("Address,Status,Confidence,BrowserConfig,Timestamp,DerivationPath"));
+        assert!(output_str.starts_with("Address,Status,Confidence,BrowserConfig,Timestamp,DerivationPath"));
     }
 
-    // TEST-ID: 1.8.1-UNIT-007
-    // AC: AC-2 (CSV Output Format)
-    // PRIORITY: P0
     #[test]
     fn test_output_results_single_finding() {
         use super::super::fingerprints::BrowserConfig;
@@ -888,9 +860,6 @@ mod tests {
         assert!(output_str.contains("Chrome/25/Win32/1366x768"));
     }
 
-    // TEST-ID: 1.8.1-UNIT-008
-    // AC: AC-2 (CSV Output Format)
-    // PRIORITY: P1
     #[test]
     fn test_output_results_multiple_findings() {
         use super::super::fingerprints::BrowserConfig;
@@ -918,40 +887,29 @@ mod tests {
         let output_str = String::from_utf8(output).unwrap();
 
         let lines: Vec<&str> = output_str.lines().collect();
-        assert_eq!(lines.len(), 3); // header + 2 findings
+        assert_eq!(lines.len(), 3);
         assert!(output_str.contains("1Address1"));
         assert!(output_str.contains("1Address2"));
     }
 
-    // TEST-ID: 1.8.1-UNIT-009
-    // AC: AC-2 (CSV Output Format)
-    // PRIORITY: P1
     #[test]
     fn test_output_results_empty() {
         use super::super::integration::VulnerabilityFinding;
         let results: Vec<VulnerabilityFinding> = vec![];
         let mut output = Vec::new();
-
         output_results_to_writer(&results, &mut output).unwrap();
         let output_str = String::from_utf8(output).unwrap();
-
         let lines: Vec<&str> = output_str.lines().collect();
-        assert_eq!(lines.len(), 1); // header only
+        assert_eq!(lines.len(), 1);
     }
 
-    // TEST-ID: 1.8.1-UNIT-010
-    // AC: AC-3 (Timestamp Formatting)
-    // PRIORITY: P0
     #[test]
     fn test_format_timestamp_iso8601() {
-        let timestamp_ms = 1365000000000; // 2013-04-03T14:40:00Z
+        let timestamp_ms = 1365000000000;
         let formatted = format_timestamp(timestamp_ms);
         assert_eq!(formatted, "2013-04-03T14:40:00Z");
     }
 
-    // TEST-ID: 1.8.1-UNIT-011
-    // AC: AC-3 (Timestamp Formatting)
-    // PRIORITY: P1
     #[test]
     fn test_format_timestamp_epoch_zero() {
         let timestamp_ms = 0;
@@ -959,26 +917,16 @@ mod tests {
         assert_eq!(formatted, "1970-01-01T00:00:00Z");
     }
 
-    // TEST-ID: 1.8.1-UNIT-012
-    // AC: AC-3 (Timestamp Formatting)
-    // PRIORITY: P1
     #[test]
     fn test_format_timestamp_invalid() {
-        // Timestamp far in the future (invalid)
         let timestamp_ms = u64::MAX;
         let formatted = format_timestamp(timestamp_ms);
-        // Should return raw number as string
         assert_eq!(formatted, u64::MAX.to_string());
     }
 
-    // TEST-ID: 1.9-UNIT-012
-    // AC: AC-4 (CLI Mode Flag)
-    // PRIORITY: P0
     #[test]
     fn test_cli_mode_flag() {
         use super::super::config::ScanMode;
-
-        // Verify ScanMode variants are accessible
         assert_eq!(ScanMode::Quick.interval_ms(), 126_000_000);
         assert_eq!(ScanMode::Standard.interval_ms(), 3_600_000);
         assert_eq!(ScanMode::Deep.interval_ms(), 60_000);
