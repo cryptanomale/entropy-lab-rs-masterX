@@ -49,14 +49,19 @@ struct MatchResult {
 // ── Bloom filter check ───────────────────────────────────────
 fn bloom_check(h0: u32, h1: u32, h2: u32, h3: u32, h4: u32) -> bool {
     let n = params.bloom_size * 32u;
+    // Guard: bloom filter not populated — let all candidates through
+    if n == 0u { return true; }
     let idx0 = (h0 ^ (h1 << 7u))  % n;
     let idx1 = (h1 ^ (h2 << 11u)) % n;
     let idx2 = (h2 ^ (h3 << 13u)) % n;
     let idx3 = (h3 ^ (h4 << 17u)) % n;
-    let w0 = bloom[idx0 >> 5u]; if (w0 >> (idx0 & 31u)) & 1u == 0u { return false; }
-    let w1 = bloom[idx1 >> 5u]; if (w1 >> (idx1 & 31u)) & 1u == 0u { return false; }
-    let w2 = bloom[idx2 >> 5u]; if (w2 >> (idx2 & 31u)) & 1u == 0u { return false; }
-    let w3 = bloom[idx3 >> 5u]; if (w3 >> (idx3 & 31u)) & 1u == 0u { return false; }
+    // FIX: wrap bitwise-AND operands in parens so `==` does not bind tighter than `&`
+    // Bad:  (w >> shift) & 1u == 0u   →  (w >> shift) & (1u == 0u)  →  u32 & bool  → naga error
+    // Good: ((w >> shift) & 1u) == 0u →  (u32) == u32               → bool         → OK
+    let w0 = bloom[idx0 >> 5u]; if ((w0 >> (idx0 & 31u)) & 1u) == 0u { return false; }
+    let w1 = bloom[idx1 >> 5u]; if ((w1 >> (idx1 & 31u)) & 1u) == 0u { return false; }
+    let w2 = bloom[idx2 >> 5u]; if ((w2 >> (idx2 & 31u)) & 1u) == 0u { return false; }
+    let w3 = bloom[idx3 >> 5u]; if ((w3 >> (idx3 & 31u)) & 1u) == 0u { return false; }
     return true;
 }
 
