@@ -1,4 +1,3 @@
-
 //! wgpu_integration.rs — Fingerprint-Aware Randstorm GPU Scanner
 //!
 //! Экспортирует `WgpuScanner` (имя сохранено для совместимости с cli.rs,
@@ -87,15 +86,15 @@ pub fn load_fingerprints(
 // ── Внутренний модуль со структурой WgpuScanner ───────────────────────────────
 mod scanner {
     use super::*;
-    use crate::scans::randstorm::core_types::{RandstormConfig, ScanEngine, SeedComponents};
+    use crate::scans::randstorm::core_types::SeedComponents;
+    use crate::scans::randstorm::config::{ScanConfig, GpuBackend};
+    use crate::scans::randstorm::prng::MathRandomEngine;
 
     pub struct WgpuScanner {
-        config:       RandstormConfig,
-        engine:       ScanEngine,
-        fingerprints: Vec<GpuFingerprint>,
-        device:       wgpu::Device,
-        queue:        wgpu::Queue,
-        pipeline:     wgpu::ComputePipeline,
+        fingerprints:      Vec<GpuFingerprint>,
+        device:            wgpu::Device,
+        queue:             wgpu::Queue,
+        pipeline:          wgpu::ComputePipeline,
         bind_group_layout: wgpu::BindGroupLayout,
     }
 
@@ -103,43 +102,52 @@ mod scanner {
         /// Конструктор — совместим с существующими вызовами:
         ///   WgpuScanner::new(config, engine, fingerprints_csv, use_gpu)
         pub fn new(
-            config: RandstormConfig,
-            engine: ScanEngine,
+            _config: ScanConfig,
+            _engine: MathRandomEngine,
             fingerprints_csv: Option<&Path>,
             _use_gpu: bool,
         ) -> anyhow::Result<Self> {
-            // Загружаем fingerprints если CSV передан
             let fingerprints = if let Some(csv) = fingerprints_csv {
                 load_fingerprints(csv, None, None, None)?
             } else {
-                // Дефолтный fingerprint — самый популярный из comprehensive.csv
-                // 1366×768, colorDepth=32, tz=0 (priority=1)
+                // Дефолтный fingerprint — 1366×768, colorDepth=32, tz=0
                 vec![GpuFingerprint {
-                    screen_width: 1366,
-                    screen_height: 768,
-                    color_depth: 32,
+                    screen_width:    1366,
+                    screen_height:   768,
+                    color_depth:     32,
                     timezone_offset: 0,
                 }]
             };
 
-            // Инициализируем wgpu синхронно через pollster
             let (device, queue, pipeline, bind_group_layout) =
                 pollster::block_on(init_gpu())?;
 
-            Ok(Self { config, engine, fingerprints, device, queue, pipeline, bind_group_layout })
+            Ok(Self { fingerprints, device, queue, pipeline, bind_group_layout })
         }
 
-        /// Запуск sweep по диапазону timestamp'ов с fingerprints
+        /// Запуск sweep по диапазону timestamp'ов.
+        ///
+        /// `bloom` — байтовый bloom-фильтр из `compute_bloom_bits` (&[u8]).
+        /// Внутри конвертируется в &[u32] для GPU-буфера.
+        /// Возвращает Vec<SeedComponents> с заполненным полем hash160.
         pub fn sweep(
             &self,
             start_ms:    u64,
             end_ms:      u64,
             interval_ms: u32,
-            bloom:       &[u32],
-            bloom_entries: usize,
+            bloom_bytes: &[u8],
         ) -> anyhow::Result<Vec<SeedComponents>> {
-            let ts_count   = ((end_ms - start_ms) / interval_ms as u64 + 1) as u32;
-            let fp_count   = self.fingerprints.len() as u32;
+            // Конвертируем &[u8] → Vec<u32> (little-endian, padding до кратности 4)
+            let padded_len = (bloom_bytes.len() + 3) & !3;
+            let mut padded = bloom_bytes.to_vec();
+            padded.resize(padded_len, 0u8);
+            let bloom_u32: Vec<u32> = padded
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+
+            let ts_count = ((end_ms - start_ms) / interval_ms as u64 + 1) as u32;
+            let fp_count = self.fingerprints.len() as u32;
 
             info!(
                 "GPU Sweep: {} timestamps × {} fingerprints = {} combinations",
@@ -148,11 +156,11 @@ mod scanner {
             );
 
             let params = GpuParams {
-                start_ms_lo:  (start_ms & 0xFFFFFFFF) as u32,
-                start_ms_hi:  (start_ms >> 32) as u32,
+                start_ms_lo: (start_ms & 0xFFFFFFFF) as u32,
+                start_ms_hi: (start_ms >> 32) as u32,
                 interval_ms,
                 fp_count,
-                bloom_size:   bloom.len() as u32,
+                bloom_size:  bloom_u32.len() as u32,
                 _pad0: 0, _pad1: 0, _pad2: 0,
             };
 
@@ -173,7 +181,7 @@ mod scanner {
             let bloom_buf = self.device.create_buffer_init(
                 &wgpu::util::BufferInitDescriptor {
                     label:    Some("bloom"),
-                    contents: bytemuck::cast_slice(bloom),
+                    contents: bytemuck::cast_slice(&bloom_u32),
                     usage:    wgpu::BufferUsages::STORAGE,
                 }
             );
@@ -183,10 +191,10 @@ mod scanner {
             let results_size  = result_stride * MAX_RESULTS as usize;
 
             let results_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label:               Some("results"),
-                size:                results_size as u64,
-                usage:               wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-                mapped_at_creation:  false,
+                label:              Some("results"),
+                size:               results_size as u64,
+                usage:              wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
             });
             let count_buf = self.device.create_buffer_init(
                 &wgpu::util::BufferInitDescriptor {
@@ -212,7 +220,7 @@ mod scanner {
             const BATCH_TS: u32 = 65536;
             let mut offset = 0u32;
             while offset < ts_count {
-                let batch   = (ts_count - offset).min(BATCH_TS);
+                let batch    = (ts_count - offset).min(BATCH_TS);
                 let x_groups = batch.div_ceil(64);
                 let y_groups = fp_count;
 
@@ -235,7 +243,7 @@ mod scanner {
                 offset += batch;
             }
 
-            // Читаем результаты
+            // Читаем результаты обратно
             let count_staging = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("count_staging"), size: 4,
                 usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
@@ -276,14 +284,15 @@ mod scanner {
             // Конвертируем GpuMatchResult → SeedComponents
             let seeds = found_results.iter().map(|r| {
                 let ts = ((r.timestamp_hi as u64) << 32) | r.timestamp_lo as u64;
-                let fp = &self.fingerprints[r.fp_index.min(self.fingerprints.len() as u32 - 1) as usize];
+                let fp_idx = (r.fp_index as usize).min(self.fingerprints.len().saturating_sub(1));
+                let fp = &self.fingerprints[fp_idx];
                 SeedComponents {
-                    timestamp_ms: ts,
-                    screen_width:  Some(fp.screen_width),
-                    screen_height: Some(fp.screen_height),
-                    color_depth:   Some(fp.color_depth),
-                    timezone_offset: Some(fp.timezone_offset),
-                    hash160: Some(r.address),
+                    timestamp_ms:    ts,
+                    screen_width:    fp.screen_width,
+                    screen_height:   fp.screen_height,
+                    color_depth:     fp.color_depth as u8,
+                    timezone_offset: fp.timezone_offset as i16,
+                    hash160:         Some(r.address),
                     ..Default::default()
                 }
             }).collect();
@@ -322,7 +331,6 @@ mod scanner {
             &wgpu::BindGroupLayoutDescriptor {
                 label: Some("randstorm_bgl"),
                 entries: &[
-                    // binding 0: GpuParams uniform
                     wgpu::BindGroupLayoutEntry {
                         binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
@@ -330,7 +338,6 @@ mod scanner {
                             has_dynamic_offset: false, min_binding_size: None,
                         }, count: None,
                     },
-                    // binding 1: fingerprints storage read
                     wgpu::BindGroupLayoutEntry {
                         binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
@@ -338,7 +345,6 @@ mod scanner {
                             has_dynamic_offset: false, min_binding_size: None,
                         }, count: None,
                     },
-                    // binding 2: bloom storage read
                     wgpu::BindGroupLayoutEntry {
                         binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
@@ -346,7 +352,6 @@ mod scanner {
                             has_dynamic_offset: false, min_binding_size: None,
                         }, count: None,
                     },
-                    // binding 3: results storage read_write
                     wgpu::BindGroupLayoutEntry {
                         binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
@@ -354,7 +359,6 @@ mod scanner {
                             has_dynamic_offset: false, min_binding_size: None,
                         }, count: None,
                     },
-                    // binding 4: result_count atomic
                     wgpu::BindGroupLayoutEntry {
                         binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
                         ty: wgpu::BindingType::Buffer {
@@ -379,7 +383,7 @@ mod scanner {
                 label:  Some("randstorm_pipeline"),
                 layout: Some(&pipeline_layout),
                 module: &shader,
-                entry_point: "randstorm_main",   // &str, не Option — исправлено
+                entry_point: "randstorm_main",
                 compilation_options: Default::default(),
                 cache: None,
             }

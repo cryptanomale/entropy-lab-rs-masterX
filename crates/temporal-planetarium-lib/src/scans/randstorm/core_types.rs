@@ -21,23 +21,26 @@ pub struct SpiderMonkeyState {
     pub current_seed: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SeedComponents {
-    pub timestamp_ms: u64,
-    pub user_agent: String,
-    pub screen_width: u32,
-    pub screen_height: u32,
-    pub color_depth: u8,
-    pub timezone_offset: i16,
-    pub language: String,
-    pub platform: String,
+    pub timestamp_ms:     u64,
+    pub user_agent:       String,
+    pub screen_width:     u32,
+    pub screen_height:    u32,
+    pub color_depth:      u8,
+    pub timezone_offset:  i16,
+    pub language:         String,
+    pub platform:         String,
+    /// hash160 of the derived public key as returned by the GPU shader ([u32; 5], little-endian)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub hash160:          Option<[u32; 5]>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanProgress {
     pub range_start: u64,
-    pub range_end: u64,
-    pub current: u64,
-    pub hits: u64,
+    pub range_end:   u64,
+    pub current:     u64,
+    pub hits:        u64,
     pub eta_seconds: Option<u64>,
 }
