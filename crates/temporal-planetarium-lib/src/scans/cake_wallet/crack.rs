@@ -72,7 +72,7 @@ pub fn run_crack(target_address: &str) -> anyhow::Result<()> {
 
     while offset < total_seeds {
         let count = std::cmp::min(batch_size, total_seeds - offset);
-        let hits = solver.compute_cake_wallet_crack(offset, count, &target_h160)?;
+        let hits = solver.compute_cake_wallet_crack_ms(offset.into(), count, &target_h160)?;
 
         for (seed_idx, change, addr_idx) in hits {
             found = true;
@@ -119,7 +119,7 @@ pub fn run_crack_timestamp(target_address: &str) -> anyhow::Result<()> {
         total_ms as f64 / 86_400_000.0
     );
 
-    let batch_size: u64 = 1 << 22; // 4M timestamps per GPU batch
+    let batch_size: u64 = 1 << 24; // 4M timestamps per GPU batch
     let mut offset_ms: u64 = 0;
     let mut found = false;
 
@@ -139,7 +139,7 @@ pub fn run_crack_timestamp(target_address: &str) -> anyhow::Result<()> {
 
         offset_ms += count as u64;
 
-        if offset_ms % (batch_size * 8) == 0 {
+        if offset_ms % (batch_size * 16) == 0 {
             info!(
                 "Progress: {:.2}%  ({}/{} ms)",
                 offset_ms as f64 / total_ms as f64 * 100.0,

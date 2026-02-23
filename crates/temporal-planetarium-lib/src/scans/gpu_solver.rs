@@ -226,6 +226,18 @@ impl GpuSolver {
             .src(source)
 			.dims(1)
             .build()?;
+			
+		// ВРЕМЕННАЯ ДИАГНОСТИКА — удалить после исправления
+		{
+			use ocl::enums::{ProgramBuildInfo, ProgramBuildInfoResult};
+			let device = pro_que.device();
+			match pro_que.program().build_info(device, ProgramBuildInfo::BuildLog) {
+				Ok(ProgramBuildInfoResult::BuildLog(log)) if !log.trim().is_empty() => {
+					eprintln!("=== OpenCL BUILD LOG ===\n{}\n========================", log);
+				}
+				_ => {}
+			}
+		}
 
         let device = pro_que.device();
         let queue = pro_que.queue().clone();
@@ -929,88 +941,6 @@ impl GpuSolver {
         }
     }
 
-    /// Compute Cake Wallet Crack (Electrum Prefix)
-    /// Scans a range of 32-bit seed indices.
-    /// Checks prefix validity (starts with "100") and then scans 40 addresses (change 0/1, index 0-19).
-    /// Returns: Vec<(seed_index, change, address_index)>
-    pub fn compute_cake_wallet_crack(
-        &self,
-        start_index: u32,
-        count: u32,
-        target_h160: &[u8; 20],
-    ) -> ocl::Result<Vec<(u32, u32, u32)>> {
-        let kernel_name = "cake_wallet_crack";
-
-        // Results buffer: Each hit stores 3 values (seed, change, index)
-        // Adjust buffer size accordingly
-        let max_hits = 1024;
-        let buffer_results = Buffer::<u64>::builder()
-            .queue(self.pro_que.queue().clone())
-            .flags(MemFlags::new().read_write().alloc_host_ptr())
-            .len(max_hits * 3) // 3 values per hit
-            .build()?;
-
-        let buffer_count = Buffer::<u32>::builder()
-            .queue(self.pro_que.queue().clone())
-            .flags(MemFlags::new().read_write().alloc_host_ptr())
-            .len(1)
-            .build()?;
-
-        buffer_count.write(&vec![0u32]).enq()?;
-
-        // Pack target Hash160
-        let mut h1 = 0u64;
-        let mut h2 = 0u64;
-        let mut h3 = 0u32;
-        for i in 0..8 {
-            h1 |= (target_h160[i] as u64) << (i * 8);
-        }
-        for i in 0..8 {
-            h2 |= (target_h160[i + 8] as u64) << (i * 8);
-        }
-        for i in 0..4 {
-            h3 |= (target_h160[i + 16] as u32) << (i * 8);
-        }
-
-        let kernel = self
-            .pro_que
-            .kernel_builder(kernel_name)
-            .arg(&buffer_results)
-            .arg(&buffer_count)
-            .arg(h1)
-            .arg(h2)
-            .arg(h3)
-            .arg(start_index) // offset
-            .global_work_size(count)
-            // Use default local work size or tune it
-            .build()?;
-
-        unsafe {
-            kernel.enq()?;
-        }
-
-        // Read count
-        let mut count_vec = vec![0u32; 1];
-        buffer_count.read(&mut count_vec).enq()?;
-        let hit_count = count_vec[0] as usize;
-
-        if hit_count > 0 {
-            let read_hits = std::cmp::min(hit_count, max_hits);
-            let mut raw_results = vec![0u64; read_hits * 3];
-            buffer_results.read(&mut raw_results).enq()?;
-
-            let mut results = Vec::new();
-            for i in 0..read_hits {
-                let seed = raw_results[i * 3] as u32;
-                let change = raw_results[i * 3 + 1] as u32;
-                let idx = raw_results[i * 3 + 2] as u32;
-                results.push((seed, change, idx));
-            }
-            Ok(results)
-        } else {
-            Ok(Vec::new())
-        }
-    }
 
     /// Compute Cake Wallet Crack — Timestamp mode (correct keyspace).
     ///
@@ -1052,7 +982,7 @@ impl GpuSolver {
         for i in 0..8  { h2 |= (target_h160[i + 8] as u64) << (i * 8); }
         for i in 0..4  { h3 |= (target_h160[i + 16] as u32) << (i * 8); }
 
-        let local_work_size = self.calculate_local_work_size(count as usize);
+        let local_work_size = 128usize;
         let global_work_size = (count as usize).div_ceil(local_work_size) * local_work_size;
 
         let kernel = self

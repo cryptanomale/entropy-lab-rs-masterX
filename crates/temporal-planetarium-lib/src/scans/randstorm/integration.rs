@@ -95,29 +95,34 @@ impl RandstormScanner {
 
                     #[cfg(not(target_os = "macos"))]
                     {
-                        // Try OpenCL first on Linux/Windows
-                        let mut opencl_success = false;
-                        #[cfg(feature = "gpu")]
+                        // On Linux/Windows: WGPU (Vulkan/DX12) FIRST — preferred for RTX 3080.
+                        // Modern NVIDIA RTX drivers have excellent Vulkan support.
+                        // OpenCL is kept as fallback for older cards or headless servers.
+                        let mut wgpu_success = false;
+                        #[cfg(feature = "wgpu")]
                         {
-                            match GpuScanner::new(config.clone(), engine, None, true) {
+                            match super::wgpu_integration::WgpuScanner::new(config.clone(), engine, None, true) {
                                 Ok(scanner) => {
-                                    info!("✅ Auto-selected Legacy GPU (OpenCL)");
-                                    gpu_scanner = Some(scanner);
-                                    opencl_success = true;
+                                    info!("✅ Auto-selected WGPU (Vulkan) backend");
+                                    wgpu_scanner = Some(scanner);
+                                    wgpu_success = true;
                                 }
-                                Err(e) => warn!("OpenCL initialization failed: {}", e),
+                                Err(e) => warn!("WGPU (Vulkan) initialization failed: {}", e),
                             }
                         }
 
-                        // Fallback to WGPU if OpenCL failed or not enabled
-                        if !opencl_success {
-                             #[cfg(feature = "wgpu")]
-                             if let Ok(scanner) = super::wgpu_integration::WgpuScanner::new(config.clone(), engine, None, true) {
-                                info!("✅ Fallback to WGPU backend");
-                                wgpu_scanner = Some(scanner);
-                             } else {
-                                warn!("WGPU initialization also failed");
-                             }
+                        // Fallback to OpenCL if WGPU failed or feature not compiled
+                        if !wgpu_success {
+                            #[cfg(feature = "gpu")]
+                            match GpuScanner::new(config.clone(), engine, None, true) {
+                                Ok(scanner) => {
+                                    info!("✅ Fallback to OpenCL backend");
+                                    gpu_scanner = Some(scanner);
+                                }
+                                Err(e) => warn!("OpenCL initialization also failed: {}", e),
+                            }
+                            #[cfg(not(any(feature = "gpu", feature = "wgpu")))]
+                            warn!("No GPU features compiled. Build with --features wgpu for RTX 3080 support.");
                         }
                     }
                 }
@@ -309,7 +314,7 @@ impl RandstormScanner {
                     compute_bloom_bits(&address_hashes, bloom_cfg.calculate_filter_size(), 15)
                 };
                 
-                match wgpu.process_batch(&batch, &bloom_bytes) {
+                match wgpu.process_batch(&batch, &bloom_bytes, &address_hashes) {
                     Ok(result) => {
                         total_processed = total_processed.saturating_add(result.keys_processed);
                         batch_matches = result.matches_found.len();
@@ -711,6 +716,11 @@ impl StreamingScan {
     /// Get next fingerprint in stream (config × timestamp permutation)
     pub fn next_fingerprint(&mut self) -> Option<super::fingerprint::BrowserFingerprint> {
         use super::fingerprint::BrowserFingerprint;
+
+        // Guard: no configs loaded → scan complete
+        if self.configs.is_empty() {
+            return None;
+        }
 
         // Try next timestamp for current config
         if let Some(ts) = self.timestamp_gen.next() {

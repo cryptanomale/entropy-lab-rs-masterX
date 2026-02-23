@@ -670,7 +670,7 @@ fn run_with_target_file(
     for ts in start_ts..=end_ts {
         let entropy = generate_entropy_msb(ts, entropy_size);
         for addr_str in &addresses {
-            if let Some((_, addr_type, _)) = parse_address_to_hash160(addr_str) {
+            if let Some((_, addr_type)) = parse_address_to_hash160(addr_str) {
                 for addr_idx in 0..addr_limit {
                     let derived = generate_address_from_entropy_vec(&entropy, addr_idx, addr_type, false);
                     checked += 1;

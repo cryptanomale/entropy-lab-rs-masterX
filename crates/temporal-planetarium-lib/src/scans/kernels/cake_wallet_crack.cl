@@ -196,7 +196,7 @@ __kernel void cake_wallet_crack(
     }
 }
 
-// ─── cake_wallet_crack ────────────────────────────────────────────────────
+// ─── cake_wallet_crack_ms ────────────────────────────────────────────────────
 // Timestamp-based cracker — the CORRECT mode for real Cake Wallet seeds.
 //
 // WHY THE OLD KERNEL FAILS:
@@ -212,10 +212,10 @@ __kernel void cake_wallet_crack(
 //   • Stores hits as (ts_ms, change, addr_idx) for easy CPU verification
 //
 // GPU_SOLVER CALL:
-//   compute_cake_wallet_crack(start_ms: u64, count: u32, target_h160: &[u8;20])
+//   compute_cake_wallet_crack_ms(start_ms: u64, count: u32, target_h160: &[u8;20])
 //   → Vec<(u64 ts_ms, u32 change, u32 addr_idx)>
 
-__kernel void cake_wallet_crack(
+__kernel void cake_wallet_crack_ms(
     __global ulong *results,       // output: [ts_ms, change, addr_idx] per hit
     __global uint  *result_count,  // atomic counter (capped at 1024 hits)
     ulong target_h160_part1,       // bytes 0..7  of Hash160, little-endian

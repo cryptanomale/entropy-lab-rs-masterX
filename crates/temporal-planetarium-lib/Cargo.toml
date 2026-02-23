@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [features]
-default = []
+default = ["wgpu"]
 gpu = ["dep:ocl"]
 gui = ["dep:eframe", "dep:egui"]
 z3-solver = ["dep:z3"]

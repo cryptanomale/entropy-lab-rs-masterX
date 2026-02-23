@@ -1,8 +1,11 @@
+#[cfg(feature = "gpu")]
 use ocl::{Context, Program};
+#[cfg(feature = "gpu")]
 use std::fs;
+#[cfg(feature = "gpu")]
 use std::path::Path;
 
-#[cfg(feature = "use_opencl")]
+#[cfg(feature = "gpu")]
 pub fn build_program(context: &Context) -> ocl::Result<Program> {
     let mut source = String::new();
 
@@ -15,7 +18,6 @@ pub fn build_program(context: &Context) -> ocl::Result<Program> {
         "sha512",
         "keccak256",
         "profanity",
-        // ⚠️ добавляй ТОЛЬКО если реально используются ядра
     ];
 
     for f in files {
@@ -29,7 +31,7 @@ pub fn build_program(context: &Context) -> ocl::Result<Program> {
         source.push('\n');
     }
 
-    //Program::builder()
+    Program::builder()
         .src(source)
         .build(context)
 }

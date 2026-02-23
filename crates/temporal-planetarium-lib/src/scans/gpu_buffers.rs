@@ -1,13 +1,17 @@
 // temporal_planetarium_lib/gpu/buffers.rs
 
+#[cfg(feature = "gpu")]
 use ocl::{Buffer, Queue, flags};
+#[cfg(feature = "gpu")]
 use super::gpu_constants::{SHA512_K, KECCAK_RC};
 
+#[cfg(feature = "gpu")]
 pub struct GpuConstBuffers {
     pub sha512_k: Buffer<u64>,
     pub keccak_rc: Buffer<u64>,
 }
 
+#[cfg(feature = "gpu")]
 impl GpuConstBuffers {
     pub fn new(queue: &Queue) -> ocl::Result<Self> {
         let sha512_k = Buffer::<u64>::builder()

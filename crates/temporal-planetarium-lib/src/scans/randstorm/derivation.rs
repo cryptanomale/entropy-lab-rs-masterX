@@ -59,6 +59,20 @@ pub fn derive_p2pkh_address_from_bytes(bytes: &[u8; 32]) -> Result<String> {
 ///
 /// Returns the RIPEMD160(SHA256(pubkey)) hash without Base58 encoding.
 /// This is used for efficient GPU-based address matching.
+/// Derive address hash from UNCOMPRESSED public key (for --randstorm-include-uncompressed)
+pub fn derive_address_hash_uncompressed(public_key: &PublicKey) -> [u8; 20] {
+    let pubkey_bytes = public_key.serialize_uncompressed();
+    let mut hasher = Sha256::new();
+    hasher.update(&pubkey_bytes);
+    let sha256_hash = hasher.finalize();
+    let mut hasher = Ripemd160::new();
+    hasher.update(&sha256_hash);
+    let ripemd_hash = hasher.finalize();
+    let mut result = [0u8; 20];
+    result.copy_from_slice(&ripemd_hash);
+    result
+}
+
 pub fn derive_address_hash(public_key: &PublicKey) -> [u8; 20] {
     let pubkey_bytes = public_key.serialize();
 

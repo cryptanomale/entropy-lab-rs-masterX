@@ -146,6 +146,19 @@ impl ScanConfig {
         }
     }
 
+    /// Create config optimized for NVIDIA RTX 3080 (WGPU/Vulkan backend)
+    ///
+    /// RTX 3080 specs: 8704 CUDA cores, 68 SMs, 10 GB GDDR6X.
+    /// Optimal batch size: 65536 (256 threads × 256 workgroups = full SM occupancy).
+    pub fn rtx3080_optimized() -> Self {
+        Self {
+            use_gpu: true,
+            gpu_backend: GpuBackend::Wgpu,
+            batch_size: Some(65_536), // 256 workgroups × 256 threads
+            ..Default::default()
+        }
+    }
+
     /// Create config for quick testing (small dataset)
     pub fn test_mode() -> Self {
         Self {
