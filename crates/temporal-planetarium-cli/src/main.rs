@@ -126,11 +126,32 @@ enum Commands {
         end: Option<u32>,
     },
     /// Scan for Trust Wallet iOS LCG (minstd_rand0) vulnerability
+    ///
+    /// Provide exactly one of --target or --targets.
+    ///
+    /// Examples:
+    ///   entropy-lab trust-wallet-lcg --target 1BpEi6DfDAUFd153wiGrvkiKW1iHBa4Lnn
+    ///   entropy-lab trust-wallet-lcg --targets /path/to/addresses.csv
+    ///   entropy-lab trust-wallet-lcg --targets wallets.csv --start 1498780800 --end 1685836800
     TrustWalletLcg {
-        #[arg(long)]
-        target: String,
+        /// Single Bitcoin address to scan for (P2PKH 1... or P2WPKH bc1q...).
+        /// Mutually exclusive with --targets.
+        #[arg(long, conflicts_with = "targets")]
+        target: Option<String>,
+
+        /// CSV / plain-text file containing one Bitcoin address per line.
+        /// Lines starting with '#' are treated as comments.
+        /// The first comma/tab/space-delimited column is used as the address;
+        /// extra columns (labels, amounts, etc.) are ignored.
+        /// Mutually exclusive with --target.
+        #[arg(long, conflicts_with = "target")]
+        targets: Option<std::path::PathBuf>,
+
+        /// Unix timestamp to start scanning from (default: 2011-01-01 = 1293840000).
         #[arg(long)]
         start: Option<u32>,
+
+        /// Unix timestamp to stop scanning at (default: 2025-01-01 = 1735689600).
         #[arg(long)]
         end: Option<u32>,
     },
@@ -432,10 +453,24 @@ fn main() -> Result<()> {
         Commands::EcNew { target, start, end } => {
             scans::ec_new::run(&target, start, end)?;
         }
-        Commands::TrustWalletLcg { target, start, end } => {
-            let start_ts = start.unwrap_or(1293840000);
-            let end_ts = end.unwrap_or(1735689600);
-            scans::trust_wallet::run_lcg(&target, start_ts, end_ts)?;
+        Commands::TrustWalletLcg { target, targets, start, end } => {
+            let start_ts = start.unwrap_or(1_293_840_000); // 2011-01-01
+            let end_ts   = end.unwrap_or(1_735_689_600);   // 2025-01-01
+
+            match (target, targets) {
+                (Some(addr), None) => {
+                    scans::trust_wallet::run_lcg(&addr, start_ts, end_ts)?;
+                }
+                (None, Some(path)) => {
+                    scans::trust_wallet::run_lcg_multi_file(&path, start_ts, end_ts)?;
+                }
+                (None, None) => {
+                    anyhow::bail!(
+                        "Provide either --target <address> or --targets <file.csv>"
+                    );
+                }
+                (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
+            }
         }
         Commands::RandstormScan {
             target_addresses,
