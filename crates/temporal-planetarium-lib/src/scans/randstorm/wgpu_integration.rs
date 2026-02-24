@@ -87,7 +87,7 @@ pub fn load_fingerprints(
 mod scanner {
     use super::*;
     use crate::scans::randstorm::core_types::SeedComponents;
-    use crate::scans::randstorm::config::{ScanConfig, GpuBackend};
+    use crate::scans::randstorm::config::ScanConfig;
     use crate::scans::randstorm::prng::MathRandomEngine;
 
     pub struct WgpuScanner {
@@ -125,11 +125,8 @@ mod scanner {
             Ok(Self { fingerprints, device, queue, pipeline, bind_group_layout })
         }
 
-        /// Запуск sweep по диапазону timestamp'ов.
-        ///
-        /// `bloom` — байтовый bloom-фильтр из `compute_bloom_bits` (&[u8]).
-        /// Внутри конвертируется в &[u32] для GPU-буфера.
-        /// Возвращает Vec<SeedComponents> с заполненным полем hash160.
+        /// Backward-compat wrapper: sweep с self.fingerprints.
+        /// Исправлена в части батчинга (см. sweep_with_fingerprints).
         pub fn sweep(
             &self,
             start_ms:    u64,
@@ -137,6 +134,29 @@ mod scanner {
             interval_ms: u32,
             bloom_bytes: &[u8],
         ) -> anyhow::Result<Vec<SeedComponents>> {
+            self.sweep_with_fingerprints(start_ms, end_ms, interval_ms, bloom_bytes, &self.fingerprints)
+        }
+
+        /// Главный метод: sweep с явно переданными fingerprints.
+        ///
+        /// Исправляет два бага оригинального sweep():
+        ///   1. ts_count переполнял u32 на диапазонах > ~49 дней.
+        ///      Теперь ts_count: u64.
+        ///   2. offset не менял start_ms в params — каждый dispatch гонял
+        ///      одни и те же timestamps снова (gid.x всегда начинался с 0).
+        ///      Теперь start_ms обновляется через queue.write_buffer на каждый батч.
+        pub fn sweep_with_fingerprints(
+            &self,
+            start_ms:     u64,
+            end_ms:       u64,
+            interval_ms:  u32,
+            bloom_bytes:  &[u8],
+            fingerprints: &[GpuFingerprint],
+        ) -> anyhow::Result<Vec<SeedComponents>> {
+            if interval_ms == 0        { anyhow::bail!("interval_ms must be > 0"); }
+            if end_ms < start_ms       { anyhow::bail!("end_ms must be >= start_ms"); }
+            if fingerprints.is_empty() { anyhow::bail!("fingerprints slice must be non-empty"); }
+
             // Конвертируем &[u8] → Vec<u32> (little-endian, padding до кратности 4)
             let padded_len = (bloom_bytes.len() + 3) & !3;
             let mut padded = bloom_bytes.to_vec();
@@ -146,35 +166,27 @@ mod scanner {
                 .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect();
 
-            let ts_count = ((end_ms - start_ms) / interval_ms as u64 + 1) as u32;
-            let fp_count = self.fingerprints.len() as u32;
+            // ИСПРАВЛЕНИЕ 1: ts_count как u64, иначе overflow при диапазоне > 49 дней
+            let ts_count: u64 = (end_ms - start_ms) / interval_ms as u64 + 1;
+            let fp_count: u32 = fingerprints.len() as u32;
 
             info!(
                 "GPU Sweep: {} timestamps × {} fingerprints = {} combinations",
                 ts_count, fp_count,
-                ts_count as u64 * fp_count as u64
+                ts_count * fp_count as u64
             );
 
-            let params = GpuParams {
-                start_ms_lo: (start_ms & 0xFFFFFFFF) as u32,
-                start_ms_hi: (start_ms >> 32) as u32,
-                interval_ms,
-                fp_count,
-                bloom_size:  bloom_u32.len() as u32,
-                _pad0: 0, _pad1: 0, _pad2: 0,
-            };
-
-            let params_buf = self.device.create_buffer_init(
-                &wgpu::util::BufferInitDescriptor {
-                    label:    Some("params"),
-                    contents: bytemuck::bytes_of(&params),
-                    usage:    wgpu::BufferUsages::UNIFORM,
-                }
-            );
+            // ИСПРАВЛЕНИЕ 2: params_buf с COPY_DST — обновляем start_ms на каждый батч
+            let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label:              Some("params"),
+                size:               std::mem::size_of::<GpuParams>() as u64,
+                usage:              wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
             let fp_buf = self.device.create_buffer_init(
                 &wgpu::util::BufferInitDescriptor {
                     label:    Some("fingerprints"),
-                    contents: bytemuck::cast_slice(&self.fingerprints),
+                    contents: bytemuck::cast_slice(fingerprints), // внешние fps
                     usage:    wgpu::BufferUsages::STORAGE,
                 }
             );
@@ -216,13 +228,26 @@ mod scanner {
                 ],
             });
 
-            // Dispatch батчами по 65536 timestamps
-            const BATCH_TS: u32 = 65536;
-            let mut offset = 0u32;
+            // Dispatch батчами по 65536 timestamps.
+            // На каждый батч двигаем start_ms в GpuParams через write_buffer,
+            // т.к. gid.x в шейдере всегда начинается с 0 внутри каждого dispatch.
+            const BATCH_TS: u64 = 65536;
+            let mut offset: u64 = 0;
             while offset < ts_count {
-                let batch    = (ts_count - offset).min(BATCH_TS);
-                let x_groups = batch.div_ceil(64);
-                let y_groups = fp_count;
+                let batch: u32 = (ts_count - offset).min(BATCH_TS) as u32;
+                let x_groups  = batch.div_ceil(64);
+                let y_groups  = fp_count;
+
+                let batch_start_ms = start_ms + offset * interval_ms as u64;
+                let params = GpuParams {
+                    start_ms_lo: (batch_start_ms & 0xFFFF_FFFF) as u32,
+                    start_ms_hi: (batch_start_ms >> 32) as u32,
+                    interval_ms,
+                    fp_count,
+                    bloom_size: bloom_u32.len() as u32,
+                    _pad0: 0, _pad1: 0, _pad2: 0,
+                };
+                self.queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
 
                 let mut encoder = self.device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor { label: Some("sweep") }
@@ -240,7 +265,7 @@ mod scanner {
                 }
                 self.queue.submit(std::iter::once(encoder.finish()));
                 self.device.poll(wgpu::Maintain::Wait);
-                offset += batch;
+                offset += batch as u64;
             }
 
             // Читаем результаты обратно
@@ -282,10 +307,11 @@ mod scanner {
             info!("GPU sweep complete. Matches: {}", found_results.len());
 
             // Конвертируем GpuMatchResult → SeedComponents
+            // fp_idx индексирует переданные fingerprints, не self.fingerprints
             let seeds = found_results.iter().map(|r| {
                 let ts = ((r.timestamp_hi as u64) << 32) | r.timestamp_lo as u64;
-                let fp_idx = (r.fp_index as usize).min(self.fingerprints.len().saturating_sub(1));
-                let fp = &self.fingerprints[fp_idx];
+                let fp_idx = (r.fp_index as usize).min(fingerprints.len().saturating_sub(1));
+                let fp = &fingerprints[fp_idx];
                 SeedComponents {
                     timestamp_ms:    ts,
                     screen_width:    fp.screen_width,
@@ -298,6 +324,11 @@ mod scanner {
             }).collect();
 
             Ok(seeds)
+        }
+
+        /// Accessor for queue (used by validator.rs)
+        pub fn queue(&self) -> &wgpu::Queue {
+            &self.queue
         }
     }
 

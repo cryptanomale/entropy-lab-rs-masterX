@@ -174,6 +174,9 @@ enum Commands {
         db: Option<std::path::PathBuf>,
         #[arg(long)]
         class: Option<String>,
+        /// CSV with fingerprints for GPU sweep (screen_width,screen_height,color_depth,timezone_offset)
+        #[arg(long)]
+        fingerprints_csv: Option<std::path::PathBuf>,
     },
     /// Import targets from CSV into the database
     DbImport {
@@ -294,7 +297,7 @@ fn get_rpc_credentials(
     let final_pass = if pass.is_empty() {
         std::env::var("RPC_PASS").map_err(|_| {
             anyhow::anyhow!(
-                "RPC_PASS must be provided via --rpc-pass flag or RPC_PASS environment variable"
+                "RPC_PASS must be provided via --rpc-user flag or RPCPASS environment variable"
             )
         })?
     } else {
@@ -325,8 +328,6 @@ fn main() -> Result<()> {
         }
         Commands::CakeWalletCrack { target } => {
             info!("Running Cake Wallet GPU Cracker (timestamp mode)...");
-            // FIX: was run_crack() — 32-bit LCG that never finds real keys.
-            // Real Cake Wallet seeds are 64-bit μs timestamps; use timestamp mode.
             scans::cake_wallet::run_crack_timestamp(&target)?;
         }
         Commands::CakeWalletDartPrng => {
@@ -347,7 +348,7 @@ fn main() -> Result<()> {
             start_timestamp,
             end_timestamp,
             multipath,
-            entropy_bits,  // ← NEW
+            entropy_bits,
             rpc_url,
             rpc_user,
             rpc_pass,
@@ -355,7 +356,6 @@ fn main() -> Result<()> {
         } => {
             info!("Running Libbitcoin 'Milk Sad' Vulnerability Reproduction...");
 
-            // Convert entropy_bits to EntropySize
             let entropy_size = match entropy_bits {
                 192 => scans::milk_sad::EntropySize::Bits192,
                 256 => scans::milk_sad::EntropySize::Bits256,
@@ -457,6 +457,7 @@ fn main() -> Result<()> {
             path_coverage,
             db,
             class,
+            fingerprints_csv,
         } => {
             scans::randstorm::cli::run_scan(
                 &target_addresses,
@@ -478,6 +479,7 @@ fn main() -> Result<()> {
                 &path_coverage,
                 db.as_deref(),
                 class.as_deref(),
+                fingerprints_csv.as_deref(),
             )?;
         }
         Commands::RandstormValidate { backend, count, engine } => {
@@ -547,7 +549,7 @@ fn main() -> Result<()> {
             let pass = passphrase
                 .or_else(|| std::env::var("NONCE_CRAWLER_PASSPHRASE").ok())
                 .unwrap_or_else(|| {
-                    tracing::warn!("⚠️  Using default encryption passphrase. Set --passphrase or NONCE_CRAWLER_PASSPHRASE for production use.");
+                    tracing::warn!("\u{26a0}\u{fe0f}  Using default encryption passphrase. Set --passphrase or NONCE_CRAWLER_PASSPHRASE for production use.");
                     DEFAULT_ENCRYPTION_PASSPHRASE.to_string()
                 });
 
@@ -555,7 +557,7 @@ fn main() -> Result<()> {
                 &z1_bytes, &z2_bytes, &r_bytes, &s1_bytes, &s2_bytes
             ) {
                 Ok(sk) => {
-                    info!("✅ SUCCESS! Private key recovered!");
+                    info!("\u{2705} SUCCESS! Private key recovered!");
 
                     let wif = bitcoin::PrivateKey::new(sk, bitcoin::Network::Bitcoin).to_wif();
                     let encrypted = encrypt_private_key(&wif, &pass)?;
@@ -584,11 +586,11 @@ fn main() -> Result<()> {
                     std::fs::write(&output, serde_json::to_string_pretty(&output_data)?)?;
                     drop(wif);
 
-                    println!("🔐 Private key recovered and encrypted!");
-                    println!("📍 Address: {}", address);
-                    println!("💾 Saved to: {}", output.display());
+                    println!("\u{1f510} Private key recovered and encrypted!");
+                    println!("\u{1f4cd} Address: {}", address);
+                    println!("\u{1f4be} Saved to: {}", output.display());
                     println!();
-                    println!("⚠️  SECURITY: Private key is encrypted with AES-256-GCM.");
+                    println!("\u{26a0}\u{fe0f}  SECURITY: Private key is encrypted with AES-256-GCM.");
                     println!("   To decrypt, use: entropy-lab list-recovered-keys --show-keys");
                 }
                 Err(e) => {
