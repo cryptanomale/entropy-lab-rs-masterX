@@ -70,7 +70,13 @@ impl WeakMathRandom {
         let seed = seed_override.unwrap_or(timestamp_ms);
         let s1 = (seed & 0xFFFF_FFFF) as u32; // low 32 bits
         let s2 = (seed >> 32) as u32;          // high 32 bits
-        let (xorshift_s0, xorshift_s1) = if engine == MathRandomEngine::XorShift128Plus {
+        // FIX 1: SpiderMonkeyLcg also uses XorShift128+ algorithm in next(),
+        // so it needs the same splitmix64 initialisation that XorShift128Plus uses.
+        // Previously xorshift_s0/s1 were left as 0 for SpiderMonkeyLcg, producing
+        // a degenerate (all-zero) PRNG output.
+        let (xorshift_s0, xorshift_s1) = if engine == MathRandomEngine::XorShift128Plus
+            || engine == MathRandomEngine::SpiderMonkeyLcg
+        {
             fn splitmix64(mut x: u64) -> u64 {
                 x = x.wrapping_add(0x9E3779B97F4A7C15);
                 let mut z = x;
@@ -115,6 +121,9 @@ impl WeakMathRandom {
                 let result = self.xorshift_s1.wrapping_add(s0);
                 ((result >> 11) as f64) / (1u64 << 53) as f64
             }
+            // SpiderMonkey 2011-2015 used XorShift128+.
+            // Previously this arm was missing the seed initialisation (xorshift_s0/s1 were 0).
+            // Fixed in from_timestamp() above — now both engines run splitmix64 init.
             MathRandomEngine::SpiderMonkeyLcg => {
                 let mut s1 = self.xorshift_s0;
                 let s0 = self.xorshift_s1;
@@ -167,6 +176,18 @@ impl WeakMathRandom {
     ///
     /// Wrong:   `((s1 as u64) << 16 + s2 as u64) >> 16` — upper bits of s1 leak
     /// Correct: `s1.wrapping_shl(16).wrapping_add(s2) >> 16` — matches JS
+    ///
+    /// # FIX 2 (IeChakraLcg)
+    ///
+    /// next() returns seed/2^48, so:
+    ///   floor(next() * 65536) = floor(seed / 2^32) = seed >> 32
+    /// Old code returned (seed >> 16) — wrong by 16 bits.
+    ///
+    /// # FIX 3 (Jsc)
+    ///
+    /// next() uses TWO LCG advances to build a 53-bit value.
+    /// next_u16() must mirror that: two advances, then val53 >> 37.
+    /// Old code did ONE advance and seed >> 16 — diverged from next().
     pub fn next_u16(&mut self) -> u16 {
         match self.engine {
             MathRandomEngine::V8Mwc1616 => {
@@ -205,26 +226,40 @@ impl WeakMathRandom {
                 let result = self.xorshift_s1.wrapping_add(s0);
                 (result >> 48) as u16
             }
+            // SpiderMonkeyLcg next_u16 mirrors next() — XorShift128+.
+            // floor(((result>>11)/2^42) * 65536) = result >> 48
             MathRandomEngine::SpiderMonkeyLcg => {
-                const MULT: u64 = 0x5DEECE66D;
-                const INC: u64 = 0xB;
-                const MASK: u64 = (1u64 << 48) - 1;
-                self.seed = self.seed.wrapping_mul(MULT).wrapping_add(INC) & MASK;
-                (self.seed >> 16) as u16
+                let mut s1 = self.xorshift_s0;
+                let s0 = self.xorshift_s1;
+                self.xorshift_s0 = s0;
+                s1 ^= s1 << 23;
+                self.xorshift_s1 = s1 ^ s0 ^ (s1 >> 17) ^ (s0 >> 26);
+                let result = self.xorshift_s1.wrapping_add(s0);
+                // floor(next()*65536): (result>>11)/2^42 * 2^16 = result >> 48
+                (result >> 48) as u16
             }
+            // FIX 3: TWO LCG advances, matching next() for Jsc.
+            // floor(val53 / 2^53 * 65536) = val53 >> 37
             MathRandomEngine::Jsc => {
                 const MULT: u64 = 0x5DEECE66D;
                 const INC: u64 = 0xB;
                 const MASK: u64 = (1u64 << 48) - 1;
                 self.seed = self.seed.wrapping_mul(MULT).wrapping_add(INC) & MASK;
-                (self.seed >> 16) as u16
+                let high = self.seed >> 22; // 26 bits
+                self.seed = self.seed.wrapping_mul(MULT).wrapping_add(INC) & MASK;
+                let low = self.seed >> 21;  // 27 bits
+                let val53 = (high << 27) | low; // 53-bit integer
+                // floor(val53 / 2^53 * 65536) = floor(val53 / 2^37) = val53 >> 37
+                (val53 >> 37) as u16
             }
+            // FIX 2: seed>>32 instead of seed>>16.
+            // next() = seed/2^48; floor(next()*65536) = floor(seed/2^32) = seed>>32.
             MathRandomEngine::IeChakraLcg => {
                 const MULT: u64 = 0x5DEECE66D;
                 const INC: u64 = 11;
                 const MASK: u64 = (1u64 << 48) - 1;
                 self.seed = self.seed.wrapping_mul(MULT).wrapping_add(INC) & MASK;
-                (self.seed >> 16) as u16
+                (self.seed >> 32) as u16
             }
             MathRandomEngine::SafariWindowsCrt => {
                 const MULT: u32 = 214_013;
@@ -389,9 +424,9 @@ mod tests {
         assert_eq!(pool1.len(), 256);
     }
 
-    /// next_u16() must equal Math.floor(65536 * Math.random()) for every step.
+    /// next_u16() must equal Math.floor(65536 * Math.random()) for V8Mwc1616.
     #[test]
-    fn test_next_u16_consistent_with_next() {
+    fn test_next_u16_consistent_with_next_v8() {
         let seed = 1_389_781_850_000u64;
         let mut prng_f =
             WeakMathRandom::from_timestamp(MathRandomEngine::V8Mwc1616, seed, None);
@@ -403,13 +438,69 @@ mod tests {
             let expected = (f_val * 65536.0).floor() as u16;
             assert_eq!(
                 u_val, expected,
-                "next_u16() must match Math.floor(65536 * Math.random())"
+                "next_u16() must match Math.floor(65536 * Math.random()) for V8Mwc1616"
+            );
+        }
+    }
+
+    /// FIX 2 regression: IeChakraLcg next_u16 must match floor(next()*65536).
+    #[test]
+    fn test_next_u16_consistent_with_next_ie_chakra() {
+        let seed = 1_389_781_850_000u64;
+        let mut prng_f =
+            WeakMathRandom::from_timestamp(MathRandomEngine::IeChakraLcg, seed, None);
+        let mut prng_u =
+            WeakMathRandom::from_timestamp(MathRandomEngine::IeChakraLcg, seed, None);
+        for _ in 0..128 {
+            let f_val = prng_f.next();
+            let u_val = prng_u.next_u16();
+            let expected = (f_val * 65536.0).floor() as u16;
+            assert_eq!(
+                u_val, expected,
+                "next_u16() must match Math.floor(65536 * Math.random()) for IeChakraLcg"
+            );
+        }
+    }
+
+    /// FIX 3 regression: Jsc next_u16 must match floor(next()*65536).
+    #[test]
+    fn test_next_u16_consistent_with_next_jsc() {
+        let seed = 1_389_781_850_000u64;
+        let mut prng_f =
+            WeakMathRandom::from_timestamp(MathRandomEngine::Jsc, seed, None);
+        let mut prng_u =
+            WeakMathRandom::from_timestamp(MathRandomEngine::Jsc, seed, None);
+        for _ in 0..128 {
+            let f_val = prng_f.next();
+            let u_val = prng_u.next_u16();
+            let expected = (f_val * 65536.0).floor() as u16;
+            assert_eq!(
+                u_val, expected,
+                "next_u16() must match Math.floor(65536 * Math.random()) for Jsc"
+            );
+        }
+    }
+
+    /// FIX 1 regression: SpiderMonkeyLcg next_u16 must match floor(next()*65536).
+    #[test]
+    fn test_next_u16_consistent_with_next_spidermonkey() {
+        let seed = 1_389_781_850_000u64;
+        let mut prng_f =
+            WeakMathRandom::from_timestamp(MathRandomEngine::SpiderMonkeyLcg, seed, None);
+        let mut prng_u =
+            WeakMathRandom::from_timestamp(MathRandomEngine::SpiderMonkeyLcg, seed, None);
+        for _ in 0..128 {
+            let f_val = prng_f.next();
+            let u_val = prng_u.next_u16();
+            let expected = (f_val * 65536.0).floor() as u16;
+            assert_eq!(
+                u_val, expected,
+                "next_u16() must match Math.floor(65536 * Math.random()) for SpiderMonkeyLcg"
             );
         }
     }
 
     /// Regression: s1 with high bits set was the original bug trigger.
-    /// With s1 = 0x6F0E6E10 the old u64 code produced a wrong upper byte.
     #[test]
     fn test_next_u16_high_s1_bits() {
         let seed = 0x6F0E_6E10u64; // low 32 bits → s1, high → s2 = 0
