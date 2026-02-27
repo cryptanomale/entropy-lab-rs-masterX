@@ -513,6 +513,8 @@ impl GpuDerivationBatcher {
 mod tests {
     use super::*;
     use bitcoin::secp256k1::Secp256k1;
+
+    #[test]
     fn test_gpu_scanner_initialization() {
         use crate::scans::randstorm::prng::MathRandomEngine;
         let config = ScanConfig::default();
