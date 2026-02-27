@@ -106,7 +106,8 @@ pub fn recover_with_passphrase_file(
         }
 
         checked += 1;
-        if checked.is_multiple_of(10000) {
+        // FIX: is_multiple_of() is nightly-only. Use % operator for stable toolchain.
+        if checked % 10000 == 0 {
             let elapsed = start_time.elapsed().as_secs_f64();
             let speed = checked as f64 / elapsed;
             info!("Tried {} passphrases | {:.0}/s", checked, speed);

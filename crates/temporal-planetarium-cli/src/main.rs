@@ -315,10 +315,11 @@ fn get_rpc_credentials(
         user
     };
 
+    // FIX: was incorrectly saying "--rpc-user flag or RPCPASS" — corrected to --rpc-pass / RPC_PASS
     let final_pass = if pass.is_empty() {
         std::env::var("RPC_PASS").map_err(|_| {
             anyhow::anyhow!(
-                "RPC_PASS must be provided via --rpc-user flag or RPCPASS environment variable"
+                "RPC_PASS must be provided via --rpc-pass flag or RPC_PASS environment variable"
             )
         })?
     } else {
@@ -377,7 +378,10 @@ fn main() -> Result<()> {
         } => {
             info!("Running Libbitcoin 'Milk Sad' Vulnerability Reproduction...");
 
+            // FIX: added explicit 128 arm; wildcard _ previously swallowed any
+            // non-192/256 value including invalid ones that clap already rejects.
             let entropy_size = match entropy_bits {
+                128 => scans::milk_sad::EntropySize::Bits128,
                 192 => scans::milk_sad::EntropySize::Bits192,
                 256 => scans::milk_sad::EntropySize::Bits256,
                 _   => scans::milk_sad::EntropySize::Bits128,

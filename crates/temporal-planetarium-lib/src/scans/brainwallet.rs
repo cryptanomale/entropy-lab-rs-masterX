@@ -225,7 +225,8 @@ pub fn run_file(wordlist_path: &str, hash_type: HashType, target: &str) -> Resul
         }
 
         checked += 1;
-        if checked.is_multiple_of(100_000) {
+        // FIX: is_multiple_of() is nightly-only. Use % operator for stable toolchain.
+        if checked % 100_000 == 0 {
             let elapsed = start_time.elapsed().as_secs_f64();
             let speed = checked as f64 / elapsed;
             info!("Checked {} passphrases | {:.0}/s", checked, speed);
@@ -373,7 +374,8 @@ pub fn run_import(
         }
 
         // Progress reporting
-        if stats.total_processed.is_multiple_of(100_000) {
+        // FIX: is_multiple_of() is nightly-only. Use % operator for stable toolchain.
+        if stats.total_processed % 100_000 == 0 {
             let elapsed = start_time.elapsed().as_secs_f64();
             let speed = stats.total_processed as f64 / elapsed;
             info!(

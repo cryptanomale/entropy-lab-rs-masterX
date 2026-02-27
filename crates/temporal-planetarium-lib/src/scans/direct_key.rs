@@ -84,7 +84,8 @@ pub fn run(
         }
 
         checked += 1;
-        if checked.is_multiple_of(500_000) {
+        // FIX: is_multiple_of() is nightly-only. Use % operator for stable toolchain.
+        if checked % 500_000 == 0 {
             let elapsed = start_time.elapsed().as_secs_f64();
             let speed = checked as f64 / elapsed;
             info!("Scanned {} seeds | {:.0} seeds/s", checked, speed);

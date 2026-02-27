@@ -15,6 +15,9 @@ pub mod profanity;
 pub mod randstorm;
 pub mod trust_wallet;
 pub mod verify_csv;
+#[cfg(feature = "gpu")]
 pub mod gpu_buffers;
+#[cfg(feature = "gpu")]
 pub mod gpu_kernels;
+#[cfg(feature = "gpu")]
 pub mod gpu_constants;

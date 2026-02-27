@@ -49,7 +49,8 @@ pub fn run(target_address: &str, start_ts: Option<u32>, end_ts: Option<u32>) -> 
         }
 
         checked += 1;
-        if checked.is_multiple_of(1_000_000) {
+        // FIX: is_multiple_of() is nightly-only. Use % operator for stable toolchain.
+        if checked % 1_000_000 == 0 {
             let elapsed = start_time.elapsed().as_secs_f64();
             info!(
                 "Checked {} timestamps ({} M/s)",
@@ -122,7 +123,8 @@ impl Mt19937 {
         for i in 0..624 {
             let y = (self.mt[i] & 0x80000000) + (self.mt[(i + 1) % 624] & 0x7fffffff);
             self.mt[i] = self.mt[(i + 397) % 624] ^ (y >> 1);
-            if !y.is_multiple_of(2) {
+            // FIX: is_multiple_of() is nightly-only. Use % operator for stable toolchain.
+            if y % 2 != 0 {
                 self.mt[i] ^= 0x9908b0df;
             }
         }
