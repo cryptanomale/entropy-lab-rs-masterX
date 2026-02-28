@@ -104,9 +104,11 @@ impl KernelProfile {
                 "mt19937_64",
                 "batch_profanity",
                 "trust_wallet_crack",
-                "trust_wallet_lcg_crack",        // single-target
-                "trust_wallet_lcg_crack_mt",     // multi-target (N addresses, one pass)
-                "trust_wallet_lcg_crack_bloom",  // bloom filter
+                "trust_wallet_lcg_crack",        // single-target, 128-bit (12 words)
+                "trust_wallet_lcg_crack_mt",     // multi-target, 128-bit
+                "trust_wallet_lcg_crack_bloom",  // bloom filter, 128-bit
+                "trust_wallet_lcg_crack_192",    // single-target, 192-bit (18 words)
+                "trust_wallet_lcg_crack_256",    // single-target, 256-bit (24 words)
 				"cake_wallet_crack",
                 "milk_sad_crack",
                 "test_mt19937",
@@ -768,14 +770,50 @@ impl GpuSolver {
         Ok(results[0..count].to_vec())
     }
 
-    /// Trust Wallet iOS — minstd_rand0 (LCG) single-target crack
+    /// Trust Wallet iOS — minstd_rand0 (LCG) single-target crack, 128-bit entropy (12 words)
     pub fn compute_trust_wallet_lcg_crack(
         &self,
         start_timestamp: u32,
         end_timestamp: u32,
         target_h160: &[u8; 20],
     ) -> ocl::Result<Vec<(u32, u32)>> {
-        let kernel_name = "trust_wallet_lcg_crack";
+        self.compute_trust_wallet_lcg_crack_inner(
+            "trust_wallet_lcg_crack", start_timestamp, end_timestamp, target_h160,
+        )
+    }
+
+    /// Trust Wallet iOS — minstd_rand0 (LCG) single-target crack, 192-bit entropy (18 words)
+    pub fn compute_trust_wallet_lcg_crack_192(
+        &self,
+        start_timestamp: u32,
+        end_timestamp: u32,
+        target_h160: &[u8; 20],
+    ) -> ocl::Result<Vec<(u32, u32)>> {
+        self.compute_trust_wallet_lcg_crack_inner(
+            "trust_wallet_lcg_crack_192", start_timestamp, end_timestamp, target_h160,
+        )
+    }
+
+    /// Trust Wallet iOS — minstd_rand0 (LCG) single-target crack, 256-bit entropy (24 words)
+    pub fn compute_trust_wallet_lcg_crack_256(
+        &self,
+        start_timestamp: u32,
+        end_timestamp: u32,
+        target_h160: &[u8; 20],
+    ) -> ocl::Result<Vec<(u32, u32)>> {
+        self.compute_trust_wallet_lcg_crack_inner(
+            "trust_wallet_lcg_crack_256", start_timestamp, end_timestamp, target_h160,
+        )
+    }
+
+    /// Shared implementation for all single-target LCG cracks
+    fn compute_trust_wallet_lcg_crack_inner(
+        &self,
+        kernel_name: &str,
+        start_timestamp: u32,
+        end_timestamp: u32,
+        target_h160: &[u8; 20],
+    ) -> ocl::Result<Vec<(u32, u32)>> {
         const MAX_RESULTS: usize = 1024;
 
         let buffer_results = Buffer::<u64>::builder()
@@ -799,7 +837,8 @@ impl GpuSolver {
         let local  = self.max_work_group_size.min(256);
         let global = (range * 6).div_ceil(local) * local;
 
-        info!("[GPU:LCG] {} ts × 6 combos → {} work items (local={})", range, range*6, local);
+        info!("[GPU:LCG:{}] {} ts × 6 combos → {} work items (local={})",
+            kernel_name, range, range * 6, local);
 
         let kernel = self
             .pro_que
@@ -813,7 +852,7 @@ impl GpuSolver {
 
         unsafe {
             if let Err(e) = kernel.cmd().global_work_size(global).local_work_size(local).enq() {
-                error!("[GPU:LCG] Kernel failed: {}", e);
+                error!("[GPU:LCG:{}] Kernel failed: {}", kernel_name, e);
                 return Err(e);
             }
         }
@@ -842,7 +881,6 @@ impl GpuSolver {
         let target_count = hash160s.len();
         if target_count == 0 { return Ok(Vec::new()); }
 
-        // Flatten N×20 bytes
         let mut flat = vec![0u8; target_count * 20];
         for (i, h) in hash160s.iter().enumerate() {
             flat[i * 20..(i + 1) * 20].copy_from_slice(h);
