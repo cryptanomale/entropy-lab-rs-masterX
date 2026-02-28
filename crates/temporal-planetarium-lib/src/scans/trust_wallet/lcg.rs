@@ -520,8 +520,7 @@ pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
 ///   P2PKH  (25 bytes): [OP_DUP OP_HASH160 OP_DATA_20 <20b> OP_EQUALVERIFY OP_CHECKSIG] → bytes[3..23]
 ///   P2SH   (23 bytes): [OP_HASH160 OP_DATA_20 <20b> OP_EQUAL]                           → bytes[2..22]
 ///   P2WPKH (22 bytes): [OP_0 OP_DATA_20 <20b>]                                           → bytes[2..22]
-#[cfg(feature = "gpu")]
-fn address_to_hash160(addr_str: &str) -> Option<[u8; 20]> {
+pub(crate) fn address_to_hash160(addr_str: &str) -> Option<[u8; 20]> {
     let address = Address::from_str(addr_str).ok()?.assume_checked();
     let script  = address.script_pubkey();
     let bytes   = script.as_bytes();
