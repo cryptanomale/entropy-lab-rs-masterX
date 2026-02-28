@@ -3,7 +3,8 @@ use bip39::Mnemonic;
 use bitcoin::bip32::{DerivationPath, Xpriv};
 use bitcoin::key::CompressedPublicKey;
 use bitcoin::secp256k1::{All, Secp256k1};
-use bitcoin::{Address, Network};
+use bitcoin::{Address, Network, XOnlyPublicKey};
+use bitcoin::key::TapTweak;
 use std::collections::HashMap;
 use std::path::Path;
 use std::str::FromStr;
@@ -43,7 +44,7 @@ impl EntropyStrategy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AddrType { P2Pkh, P2Wpkh, P2ShP2Wpkh }
+enum AddrType { P2Pkh, P2Wpkh, P2ShP2Wpkh, P2Tr }
 
 fn decode_combo(combo: u32) -> (EntropyStrategy, &'static str, AddrType) {
     match combo {
@@ -53,6 +54,8 @@ fn decode_combo(combo: u32) -> (EntropyStrategy, &'static str, AddrType) {
         3 => (EntropyStrategy::BytePerCallMod, "m/84'/0'/0'/0/0", AddrType::P2Wpkh),
         4 => (EntropyStrategy::BytePerCallAnd, "m/49'/0'/0'/0/0", AddrType::P2ShP2Wpkh),
         5 => (EntropyStrategy::BytePerCallMod, "m/49'/0'/0'/0/0", AddrType::P2ShP2Wpkh),
+        6 => (EntropyStrategy::BytePerCallAnd, "m/86'/0'/0'/0/0", AddrType::P2Tr),
+        7 => (EntropyStrategy::BytePerCallMod, "m/86'/0'/0'/0/0", AddrType::P2Tr),
         _ => (EntropyStrategy::BytePerCallAnd, "m/44'/0'/0'/0/0", AddrType::P2Pkh),
     }
 }
@@ -95,7 +98,7 @@ pub fn run_multi(targets: &[String], start_ts: u32, end_ts: u32) -> Result<()> {
         }
 
         info!(
-            "[GPU] {} valid target(s) × {} timestamps × 6 combos",
+            "[GPU] {} valid target(s) × {} timestamps × 8 combos",
             valid_targets.len(),
             end_ts.saturating_sub(start_ts) + 1
         );
@@ -139,23 +142,9 @@ pub fn run_multi(targets: &[String], start_ts: u32, end_ts: u32) -> Result<()> {
                 Err(e) => { warn!("[GPU] derive ts={}: {}", timestamp, e); continue; }
             };
 
-            let address_str = match addr_type {
-                AddrType::P2Wpkh => {
-                    match CompressedPublicKey::from_private_key(&secp, &child.to_priv()) {
-                        Ok(cpk) => Address::p2wpkh(&cpk, network).to_string(),
-                        Err(e)  => { warn!("[GPU] pubkey p2wpkh: {}", e); continue; }
-                    }
-                }
-                AddrType::P2ShP2Wpkh => {
-                    match CompressedPublicKey::from_private_key(&secp, &child.to_priv()) {
-                        Ok(cpk) => Address::p2shwpkh(&cpk, network).to_string(),
-                        Err(e)  => { warn!("[GPU] pubkey p2shwpkh: {}", e); continue; }
-                    }
-                }
-                AddrType::P2Pkh => {
-                    let pubkey = child.to_keypair(&secp).public_key();
-                    Address::p2pkh(bitcoin::PublicKey::new(pubkey), network).to_string()
-                }
+            let address_str = match derive_address(&secp, &child, addr_type, network) {
+                Some(a) => a,
+                None    => { warn!("[GPU] derive_address failed ts={} combo={}", timestamp, combo); continue; }
             };
 
             if address_str == target_addr {
@@ -191,6 +180,7 @@ pub fn run_multi(targets: &[String], start_ts: u32, end_ts: u32) -> Result<()> {
             ("m/44'/0'/0'/0/0", AddrType::P2Pkh),
             ("m/84'/0'/0'/0/0", AddrType::P2Wpkh),
             ("m/49'/0'/0'/0/0", AddrType::P2ShP2Wpkh),
+            ("m/86'/0'/0'/0/0", AddrType::P2Tr),
         ];
         let strategies = [EntropyStrategy::BytePerCallAnd, EntropyStrategy::BytePerCallMod];
 
@@ -199,7 +189,7 @@ pub fn run_multi(targets: &[String], start_ts: u32, end_ts: u32) -> Result<()> {
         let t0            = std::time::Instant::now();
 
         info!(
-            "[CPU] Scanning {} timestamps × 2 strategies × 3 paths × {} target(s)...",
+            "[CPU] Scanning {} timestamps × 2 strategies × 4 paths × {} target(s)...",
             end_ts.saturating_sub(start_ts) + 1,
             targets.len()
         );
@@ -228,23 +218,9 @@ pub fn run_multi(targets: &[String], start_ts: u32, end_ts: u32) -> Result<()> {
                         Ok(c)  => c, Err(_) => continue,
                     };
 
-                    let address_str = match addr_type {
-                        AddrType::P2Wpkh => {
-                            match CompressedPublicKey::from_private_key(&secp, &child.to_priv()) {
-                                Ok(cpk) => Address::p2wpkh(&cpk, network).to_string(),
-                                Err(_)  => continue,
-                            }
-                        }
-                        AddrType::P2ShP2Wpkh => {
-                            match CompressedPublicKey::from_private_key(&secp, &child.to_priv()) {
-                                Ok(cpk) => Address::p2shwpkh(&cpk, network).to_string(),
-                                Err(_)  => continue,
-                            }
-                        }
-                        AddrType::P2Pkh => {
-                            let pubkey = child.to_keypair(&secp).public_key();
-                            Address::p2pkh(bitcoin::PublicKey::new(pubkey), network).to_string()
-                        }
+                    let address_str = match derive_address(&secp, &child, addr_type, network) {
+                        Some(a) => a,
+                        None    => continue,
                     };
 
                     if let Some(&_idx) = target_map.get(address_str.as_str()) {
@@ -386,7 +362,10 @@ pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
         let valid = Address::from_str(addr)
             .ok()
             .and_then(|a| a.require_network(network).ok())
-            .map(|a| { let s = a.script_pubkey(); s.is_p2pkh() || s.is_p2sh() || s.is_p2wpkh() })
+            .map(|a| {
+                let s = a.script_pubkey();
+                s.is_p2pkh() || s.is_p2sh() || s.is_p2wpkh() || s.is_p2tr()
+            })
             .unwrap_or(false);
 
         if valid {
@@ -406,6 +385,9 @@ pub fn load_targets_from_csv(path: &Path) -> Result<Vec<String>> {
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
+/// Extract a 20-byte key for GPU comparison.
+/// For P2TR (bc1p): HASH160(x-only-pubkey) — matches what the GPU kernel computes
+/// via taproot_identifier().
 pub(crate) fn address_to_hash160(addr_str: &str) -> Option<[u8; 20]> {
     let address = Address::from_str(addr_str).ok()?.assume_checked();
     let script  = address.script_pubkey();
@@ -413,9 +395,48 @@ pub(crate) fn address_to_hash160(addr_str: &str) -> Option<[u8; 20]> {
     if      script.is_p2pkh()  && bytes.len() == 25 { bytes[3..23].try_into().ok() }
     else if script.is_p2sh()   && bytes.len() == 23 { bytes[2..22].try_into().ok() }
     else if script.is_p2wpkh() && bytes.len() == 22 { bytes[2..22].try_into().ok() }
+    else if script.is_p2tr()   && bytes.len() == 34 {
+        // witness program = 32-byte tweaked x-only pubkey (bytes[2..34])
+        // GPU kernel does HASH160(tweaked_x_only) for comparison → match that
+        use bitcoin::hashes::{Hash, ripemd160, sha256};
+        let sha = sha256::Hash::hash(&bytes[2..34]);
+        let h160 = ripemd160::Hash::hash(&sha[..]);
+        h160.as_byte_array().try_into().ok()
+    }
     else { None }
 }
 
+/// Derive a Bitcoin address string from a child key.
+fn derive_address(
+    secp:      &Secp256k1<All>,
+    child:     &Xpriv,
+    addr_type: AddrType,
+    network:   Network,
+) -> Option<String> {
+    Some(match addr_type {
+        AddrType::P2Pkh => {
+            let pk = child.to_keypair(secp).public_key();
+            Address::p2pkh(bitcoin::PublicKey::new(pk), network).to_string()
+        }
+        AddrType::P2Wpkh => {
+            let cpk = CompressedPublicKey::from_private_key(secp, &child.to_priv()).ok()?;
+            Address::p2wpkh(&cpk, network).to_string()
+        }
+        AddrType::P2ShP2Wpkh => {
+            let cpk = CompressedPublicKey::from_private_key(secp, &child.to_priv()).ok()?;
+            Address::p2shwpkh(&cpk, network).to_string()
+        }
+        AddrType::P2Tr => {
+            let keypair  = child.to_keypair(secp);
+            let (xonly, _parity) = keypair.x_only_public_key();
+            let tweaked  = xonly.tap_tweak(secp, None);
+            Address::p2tr_tweaked(tweaked.0, network).to_string()
+        }
+    })
+}
+
+/// Derive HASH160 of the script-pubkey output (used by bloom verify).
+/// For P2TR: HASH160(tweaked_x_only_32_bytes) — same as address_to_hash160.
 #[cfg(feature = "gpu")]
 fn derive_hash160(
     secp:      &Secp256k1<All>,
@@ -436,12 +457,24 @@ fn derive_hash160(
             let cpk = CompressedPublicKey::from_private_key(secp, &child.to_priv()).ok()?;
             Address::p2shwpkh(&cpk, network).script_pubkey()
         }
+        AddrType::P2Tr => {
+            let keypair = child.to_keypair(secp);
+            let (xonly, _parity) = keypair.x_only_public_key();
+            let tweaked = xonly.tap_tweak(secp, None);
+            Address::p2tr_tweaked(tweaked.0, network).script_pubkey()
+        }
     };
     let bytes = script.as_bytes();
     match addr_type {
         AddrType::P2Pkh      if bytes.len() == 25 => bytes[3..23].try_into().ok(),
         AddrType::P2Wpkh     if bytes.len() == 22 => bytes[2..22].try_into().ok(),
         AddrType::P2ShP2Wpkh if bytes.len() == 23 => bytes[2..22].try_into().ok(),
+        AddrType::P2Tr       if bytes.len() == 34 => {
+            use bitcoin::hashes::{Hash, ripemd160, sha256};
+            let sha  = sha256::Hash::hash(&bytes[2..34]);
+            let h160 = ripemd160::Hash::hash(&sha[..]);
+            h160.as_byte_array().try_into().ok()
+        }
         _ => None,
     }
 }
@@ -487,6 +520,13 @@ mod tests {
     #[test]
     fn test_address_to_hash160_p2sh() {
         assert!(address_to_hash160("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy").is_some());
+    }
+
+    #[test]
+    fn test_address_to_hash160_p2tr_returns_some() {
+        // bc1p genesis-style known Taproot address
+        let result = address_to_hash160("bc1pcn47dt54myymwxpp6lgkvn32k57pu80gnr5auu7newrqpetd6cssfskzm9");
+        assert!(result.is_some(), "P2TR address_to_hash160 must return Some");
     }
 
     #[test]
@@ -544,6 +584,8 @@ mod tests {
             (EntropyStrategy::BytePerCallMod, "m/84'/0'/0'/0/0", AddrType::P2Wpkh),
             (EntropyStrategy::BytePerCallAnd, "m/49'/0'/0'/0/0", AddrType::P2ShP2Wpkh),
             (EntropyStrategy::BytePerCallMod, "m/49'/0'/0'/0/0", AddrType::P2ShP2Wpkh),
+            (EntropyStrategy::BytePerCallAnd, "m/86'/0'/0'/0/0", AddrType::P2Tr),
+            (EntropyStrategy::BytePerCallMod, "m/86'/0'/0'/0/0", AddrType::P2Tr),
         ];
         for (i, &(ref exp_s, exp_p, exp_at)) in expected.iter().enumerate() {
             let (s, p, at) = decode_combo(i as u32);
@@ -578,6 +620,13 @@ mod tests {
         let f = write_temp_csv("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy,label\n");
         let result = load_targets_from_csv(f.path()).unwrap();
         assert_eq!(result[0], "3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy");
+    }
+
+    #[test]
+    fn test_csv_p2tr_address_accepted() {
+        let f = write_temp_csv("bc1pcn47dt54myymwxpp6lgkvn32k57pu80gnr5auu7newrqpetd6cssfskzm9,label\n");
+        let result = load_targets_from_csv(f.path()).unwrap();
+        assert_eq!(result[0], "bc1pcn47dt54myymwxpp6lgkvn32k57pu80gnr5auu7newrqpetd6cssfskzm9");
     }
 
     #[test]
