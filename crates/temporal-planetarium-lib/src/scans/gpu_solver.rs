@@ -105,7 +105,7 @@ impl KernelProfile {
                 "batch_profanity",
                 "trust_wallet_crack",
                 "trust_wallet_lcg_crack",        // single-target, 128-bit (12 words), 8 combos
-                "trust_wallet_lcg_crack_mt",     // multi-target, 128-bit
+                "trust_wallet_lcg_crack_mt",     // multi-target, 128-bit, 8 combos
                 "trust_wallet_lcg_crack_bloom",  // bloom filter, 128-bit
                 "trust_wallet_lcg_crack_192",    // single-target, 192-bit (18 words), 8 combos
                 "trust_wallet_lcg_crack_256",    // single-target, 256-bit (24 words), 8 combos
@@ -869,7 +869,7 @@ impl GpuSolver {
         Ok(raw[..count].iter().map(|&v| ((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32)).collect())
     }
 
-    /// Trust Wallet iOS — minstd_rand0 (LCG) MULTI-TARGET crack
+    /// Trust Wallet iOS — minstd_rand0 (LCG) MULTI-TARGET crack, 8 combos (incl. P2TR)
     ///
     /// Scans all N hash160 targets in a single GPU pass.
     /// Returns Vec<(timestamp, combo, target_idx)>.
@@ -912,12 +912,12 @@ impl GpuSolver {
 
         let range  = (end_timestamp - start_timestamp) as usize;
         let local  = self.max_work_group_size.min(256);
-        // NOTE: trust_wallet_lcg_crack_mt still uses 6 combos (no P2TR yet in MT kernel)
-        let global = (range * 6).div_ceil(local) * local;
+        // 8 combos: VariantAnd/Mod × m/44'(P2PKH), m/84'(P2WPKH), m/49'(P2SH-P2WPKH), m/86'(P2TR)
+        let global = (range * 8).div_ceil(local) * local;
 
         info!(
-            "[GPU:LCG-MT] {} ts × 6 combos × {} targets → {} work items (local={})",
-            range, target_count, range * 6, local
+            "[GPU:LCG-MT] {} ts × 8 combos × {} targets → {} work items (local={})",
+            range, target_count, range * 8, local
         );
 
         let kernel = self
@@ -993,7 +993,7 @@ impl GpuSolver {
 
         let range  = (end_timestamp - start_timestamp) as usize;
         let local  = self.max_work_group_size.min(256);
-        // bloom kernel still uses 6 combos
+        // bloom kernel still uses 6 combos (no P2TR in bloom CL yet)
         let global = (range * 6).div_ceil(local) * local;
 
         info!("[GPU:BLOOM] {} ts × 6 → {} work items (local={})", range, range*6, local);
