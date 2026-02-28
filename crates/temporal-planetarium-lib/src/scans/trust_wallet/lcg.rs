@@ -12,6 +12,15 @@ use tracing::{info, warn};
 #[cfg(feature = "gpu")]
 use crate::scans::gpu_solver::GpuSolver;
 
+/// Known-vulnerable time windows for CVE-2024-23660 (Trust Wallet iOS)
+/// Source: Unciphered disclosure, confirmed via on-chain analysis
+pub const CVE_2024_23660_START: u32 = 1_498_780_800; // 2017-06-30 — earliest known affected build
+pub const CVE_2024_23660_END:   u32 = 1_685_836_800; // 2023-06-04 — patch release date
+
+/// Default scan window (tighter, higher-confidence range)
+pub const CVE_2024_23660_LIKELY_START: u32 = 1_640_000_000; // ~2021-12-20
+pub const CVE_2024_23660_LIKELY_END:   u32 = 1_685_836_800; // 2023-06-04
+
 /// Trust Wallet iOS Vulnerability Scanner (CVE-2024-23660)
 ///
 /// Uses `std::minstd_rand0` (Lehmer LCG, a=16807, m=2^31-1) seeded with
