@@ -104,11 +104,11 @@ impl KernelProfile {
                 "mt19937_64",
                 "batch_profanity",
                 "trust_wallet_crack",
-                "trust_wallet_lcg_crack",        // single-target, 128-bit (12 words)
+                "trust_wallet_lcg_crack",        // single-target, 128-bit (12 words), 8 combos
                 "trust_wallet_lcg_crack_mt",     // multi-target, 128-bit
                 "trust_wallet_lcg_crack_bloom",  // bloom filter, 128-bit
-                "trust_wallet_lcg_crack_192",    // single-target, 192-bit (18 words)
-                "trust_wallet_lcg_crack_256",    // single-target, 256-bit (24 words)
+                "trust_wallet_lcg_crack_192",    // single-target, 192-bit (18 words), 8 combos
+                "trust_wallet_lcg_crack_256",    // single-target, 256-bit (24 words), 8 combos
 				"cake_wallet_crack",
                 "milk_sad_crack",
                 "test_mt19937",
@@ -231,7 +231,7 @@ impl GpuSolver {
             .src(source)
 			.dims(1)
             .build()?;
-			
+		
 		{
 			use ocl::enums::{ProgramBuildInfo, ProgramBuildInfoResult};
 			let device = pro_que.device();
@@ -807,6 +807,7 @@ impl GpuSolver {
     }
 
     /// Shared implementation for all single-target LCG cracks
+    /// Combos 0-7: VariantAnd/Mod × m/44'(P2PKH), m/84'(P2WPKH), m/49'(P2SH-P2WPKH), m/86'(P2TR)
     fn compute_trust_wallet_lcg_crack_inner(
         &self,
         kernel_name: &str,
@@ -835,10 +836,11 @@ impl GpuSolver {
 
         let range  = (end_timestamp - start_timestamp) as usize;
         let local  = self.max_work_group_size.min(256);
-        let global = (range * 6).div_ceil(local) * local;
+        // 8 combos: VariantAnd/Mod × m/44', m/84', m/49', m/86'(P2TR)
+        let global = (range * 8).div_ceil(local) * local;
 
-        info!("[GPU:LCG:{}] {} ts × 6 combos → {} work items (local={})",
-            kernel_name, range, range * 6, local);
+        info!("[GPU:LCG:{}] {} ts × 8 combos → {} work items (local={})",
+            kernel_name, range, range * 8, local);
 
         let kernel = self
             .pro_que
@@ -910,6 +912,7 @@ impl GpuSolver {
 
         let range  = (end_timestamp - start_timestamp) as usize;
         let local  = self.max_work_group_size.min(256);
+        // NOTE: trust_wallet_lcg_crack_mt still uses 6 combos (no P2TR yet in MT kernel)
         let global = (range * 6).div_ceil(local) * local;
 
         info!(
@@ -990,6 +993,7 @@ impl GpuSolver {
 
         let range  = (end_timestamp - start_timestamp) as usize;
         let local  = self.max_work_group_size.min(256);
+        // bloom kernel still uses 6 combos
         let global = (range * 6).div_ceil(local) * local;
 
         info!("[GPU:BLOOM] {} ts × 6 → {} work items (local={})", range, range*6, local);
