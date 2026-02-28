@@ -399,9 +399,9 @@ pub(crate) fn address_to_hash160(addr_str: &str) -> Option<[u8; 20]> {
         // witness program = 32-byte tweaked x-only pubkey (bytes[2..34])
         // GPU kernel does HASH160(tweaked_x_only) for comparison → match that
         use bitcoin::hashes::{Hash, ripemd160, sha256};
-        let sha = sha256::Hash::hash(&bytes[2..34]);
+        let sha  = sha256::Hash::hash(&bytes[2..34]);
         let h160 = ripemd160::Hash::hash(&sha[..]);
-        h160.as_byte_array().try_into().ok()
+        Some(*h160.as_byte_array())
     }
     else { None }
 }
@@ -473,7 +473,7 @@ fn derive_hash160(
             use bitcoin::hashes::{Hash, ripemd160, sha256};
             let sha  = sha256::Hash::hash(&bytes[2..34]);
             let h160 = ripemd160::Hash::hash(&sha[..]);
-            h160.as_byte_array().try_into().ok()
+            Some(*h160.as_byte_array())
         }
         _ => None,
     }
