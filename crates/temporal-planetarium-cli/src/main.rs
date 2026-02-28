@@ -116,14 +116,32 @@ enum Commands {
     },
     /// Scan for bip3x (PCG-XSH-RR) vulnerability
     Bip3x,
-    /// Scan for EC-New (Direct PRNG) vulnerability
+    /// Scan for EC-New (Direct PRNG → bx ec-new) vulnerability.
+    ///
+    /// The real seed space is the full u32 range (bx seed casts nanoseconds to u32).
+    /// Use --full-scan to cover it entirely, or --start/--end for a timestamp slice.
+    ///
+    /// Examples:
+    ///   ec-new --target 1Abc... --start 1644496801 --end 1645188001
+    ///   ec-new --target 1Abc... --full-scan
+    ///   ec-new --target 1Abc... --full-scan --threads 16
     EcNew {
+        /// Bitcoin address to search for.
         #[arg(long)]
         target: String,
+        /// Start of Unix timestamp range (inclusive). Ignored when --full-scan is set.
         #[arg(long)]
         start: Option<u32>,
+        /// End of Unix timestamp range (inclusive). Ignored when --full-scan is set.
         #[arg(long)]
         end: Option<u32>,
+        /// Scan the entire u32 seed space (0 ..= 4_294_967_295).
+        /// Overrides --start / --end.
+        #[arg(long, default_value = "false")]
+        full_scan: bool,
+        /// Number of CPU threads to use (default: all logical cores).
+        #[arg(long)]
+        threads: Option<usize>,
     },
     /// Scan for Trust Wallet iOS LCG (minstd_rand0) vulnerability
     ///
@@ -315,7 +333,6 @@ fn get_rpc_credentials(
         user
     };
 
-    // FIX: was incorrectly saying "--rpc-user flag or RPCPASS" — corrected to --rpc-pass / RPC_PASS
     let final_pass = if pass.is_empty() {
         std::env::var("RPC_PASS").map_err(|_| {
             anyhow::anyhow!(
@@ -378,8 +395,6 @@ fn main() -> Result<()> {
         } => {
             info!("Running Libbitcoin 'Milk Sad' Vulnerability Reproduction...");
 
-            // FIX: added explicit 128 arm; wildcard _ previously swallowed any
-            // non-192/256 value including invalid ones that clap already rejects.
             let entropy_size = match entropy_bits {
                 128 => scans::milk_sad::EntropySize::Bits128,
                 192 => scans::milk_sad::EntropySize::Bits192,
@@ -454,12 +469,12 @@ fn main() -> Result<()> {
         Commands::Bip3x => {
             scans::bip3x::run()?;
         }
-        Commands::EcNew { target, start, end } => {
-            scans::ec_new::run(&target, start, end)?;
+        Commands::EcNew { target, start, end, full_scan, threads } => {
+            scans::ec_new::run(&target, start, end, full_scan, threads)?;
         }
         Commands::TrustWalletLcg { target, targets, start, end } => {
-            let start_ts = start.unwrap_or(1_293_840_000); // 2011-01-01
-            let end_ts   = end.unwrap_or(1_735_689_600);   // 2025-01-01
+            let start_ts = start.unwrap_or(1_293_840_000);
+            let end_ts   = end.unwrap_or(1_735_689_600);
 
             match (target, targets) {
                 (Some(addr), None) => {
