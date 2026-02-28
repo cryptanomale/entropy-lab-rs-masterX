@@ -590,6 +590,36 @@ mod tests {
     use std::io::Write;
 
     #[test]
+fn test_cve_window_constants_ordering() {
+    assert!(CVE_2024_23660_START    < CVE_2024_23660_END);
+    assert!(CVE_2024_23660_LIKELY_START >= CVE_2024_23660_START);
+    assert!(CVE_2024_23660_LIKELY_END   <= CVE_2024_23660_END);
+}
+
+    #[test]
+fn test_address_to_hash160_p2pkh() {
+    // Genesis coinbase address — known hash160
+    let result = address_to_hash160("1A1zP1eP5QGefi2DMPTfTL5SLmv7Divf");
+    assert!(result.is_some());
+    assert_eq!(
+        hex::encode(result.unwrap()),
+        "62e907b15cbf27d5425399ebf6f0fb50ebb88f18"
+    );
+}
+
+    #[test]
+fn test_address_to_hash160_p2sh() {
+    let result = address_to_hash160("3J98t1WpEZ73CNmQviecrnyiWrnqRhWNLy");
+    assert!(result.is_some());
+}
+
+    #[test]
+fn test_address_to_hash160_invalid_returns_none() {
+    assert!(address_to_hash160("not_an_address").is_none());
+    assert!(address_to_hash160("0x742d35Cc6634C0532925a3b8D4C9B7E8f8E0dD44").is_none());
+}
+
+    #[test]
     fn test_minstd_first_two_outputs() {
         let mut rng = MinstdRand0::new(1);
         assert_eq!(rng.next_u32(), 16_807);
