@@ -52,7 +52,6 @@ impl RandstormScanner {
             .context("Failed to load comprehensive fingerprint database")?;
 
         let mut gpu_scanner = None;
-        // FIX 1: wgpu_scanner must be mut so we can assign the created scanner into it
         #[cfg(feature = "wgpu")]
         let mut wgpu_scanner: Option<super::wgpu_integration::WgpuScanner> = None;
 
@@ -66,7 +65,6 @@ impl RandstormScanner {
                         #[cfg(feature = "wgpu")]
                         match super::wgpu_integration::WgpuScanner::new(config.clone(), engine, None, true) {
                             Ok(scanner) => {
-                                // FIX 1: was Ok(_scanner) — scanner was dropped immediately
                                 info!("\u{2705} Auto-selected WGPU (Metal) backend");
                                 wgpu_scanner = Some(scanner);
                             }
@@ -89,9 +87,6 @@ impl RandstormScanner {
                         #[cfg(feature = "wgpu")]
                         match super::wgpu_integration::WgpuScanner::new(config.clone(), engine, None, true) {
                             Ok(scanner) => {
-                                // FIX 1: was Ok(_scanner) — scanner was dropped immediately,
-                                // wgpu_success flag was set but wgpu_scanner remained None.
-                                // Now correctly saved to wgpu_scanner.
                                 info!("\u{2705} Auto-selected WGPU (Vulkan) backend");
                                 wgpu_scanner = Some(scanner);
                             }
@@ -117,7 +112,6 @@ impl RandstormScanner {
                     #[cfg(feature = "wgpu")]
                     match super::wgpu_integration::WgpuScanner::new(config.clone(), engine, None, true) {
                         Ok(scanner) => {
-                            // FIX 1: was Ok(_scanner) — dropped immediately
                             info!("\u{2705} Forced WGPU backend enabled");
                             wgpu_scanner = Some(scanner);
                         }
@@ -253,7 +247,7 @@ impl RandstormScanner {
             #[cfg(feature = "wgpu")]
             if let Some(ref wgpu) = self.wgpu_scanner {
                 if total_processed == 0 {
-                    warn!("\u{26a0}\u{fe0f}  WGPU MODE: ECC/Hashing not yet fully implemented in WGSL (Epic 3).");
+                    warn!("\u{26a0}\u{fe0f}  WGPU MODE: Bloom-based candidate filtering. CPU verification active.");
                 }
 
                 let bloom_bytes = {
@@ -273,56 +267,68 @@ impl RandstormScanner {
                 match wgpu.sweep(start_ms, end_ms, interval_ms, &bloom_bytes) {
                     Ok(seed_hits) => {
                         total_processed = total_processed.saturating_add(batch.len() as u64);
-                        batch_matches   = seed_hits.len();
+
+                        // FIX: CPU verification of GPU bloom hits
+                        // GPU returns candidates based on bloom filter, which has false positives.
+                        // We must derive the actual Bitcoin address on CPU and verify against targets.
+                        use bitcoin::secp256k1::{PublicKey as Secp256k1PublicKey, Secp256k1, SecretKey};
+                        use std::collections::HashSet;
+
+                        let target_set: HashSet<&str> = target_addresses.iter().map(|s| s.as_str()).collect();
+                        let secp = Secp256k1::new();
 
                         for seed in seed_hits {
-                            let fp_meta = batch.iter()
-                                .find(|fp| fp.timestamp_ms == seed.timestamp_ms)
-                                .cloned()
-                                .unwrap_or_else(|| batch[0].clone());
+                            let key_bytes = super::prng::bitcoinjs_v013::BitcoinJsV013Prng::generate_privkey_bytes(
+                                seed.timestamp_ms, self.engine, None,
+                            );
 
-                            let browser_config = BrowserConfig {
-                                priority:              1,
-                                user_agent:            fp_meta.user_agent.clone(),
-                                screen_width:          seed.screen_width,
-                                screen_height:         seed.screen_height,
-                                color_depth:           seed.color_depth as u8,
-                                timezone_offset:       seed.timezone_offset as i16,
-                                language:              fp_meta.language.clone(),
-                                platform:              fp_meta.platform.clone(),
-                                market_share_estimate: 0.0,
-                                year_min:              2014,
-                                year_max:              2016,
-                            };
+                            if let Ok(sk) = SecretKey::from_slice(&key_bytes) {
+                                let pk = Secp256k1PublicKey::from_secret_key(&secp, &sk);
 
-                            let matched_addr = if let Some(h160_words) = seed.hash160 {
-                                let mut h160_bytes = [0u8; 20];
-                                for (i, w) in h160_words.iter().enumerate() {
-                                    let b = w.to_le_bytes();
-                                    h160_bytes[i * 4..i * 4 + 4].copy_from_slice(&b);
+                                // Check compressed and uncompressed
+                                for compressed in [true, false] {
+                                    let btc_pk = bitcoin::PublicKey { inner: pk, compressed };
+                                    let addr = Address::p2pkh(&btc_pk, bitcoin::Network::Bitcoin);
+                                    let addr_str = addr.to_string();
+
+                                    if target_set.contains(addr_str.as_str()) {
+                                        info!("\u{1f3af} GPU Hit (verified): {} @ ts={}", addr_str, seed.timestamp_ms);
+
+                                        let fp_meta = batch.iter()
+                                            .find(|fp| fp.timestamp_ms == seed.timestamp_ms)
+                                            .cloned()
+                                            .unwrap_or_else(|| batch[0].clone());
+
+                                        let browser_config = BrowserConfig {
+                                            priority:              1,
+                                            user_agent:            fp_meta.user_agent.clone(),
+                                            screen_width:          seed.screen_width,
+                                            screen_height:         seed.screen_height,
+                                            color_depth:           seed.color_depth,
+                                            timezone_offset:       seed.timezone_offset,
+                                            language:              fp_meta.language.clone(),
+                                            platform:              fp_meta.platform.clone(),
+                                            market_share_estimate: 0.0,
+                                            year_min:              2014,
+                                            year_max:              2016,
+                                        };
+
+                                        findings.push(VulnerabilityFinding {
+                                            address: addr_str,
+                                            confidence: match phase {
+                                                Phase::One   => Confidence::High,
+                                                Phase::Two   => Confidence::Medium,
+                                                Phase::Three => Confidence::Low,
+                                            },
+                                            browser_config,
+                                            timestamp:       seed.timestamp_ms,
+                                            derivation_path: "wgpu-verified".to_string(),
+                                        });
+                                        batch_matches += 1;
+                                        break; // Found match, stop checking compressed/uncompressed
+                                    }
                                 }
-                                target_addresses.iter()
-                                    .zip(address_hashes.iter())
-                                    .find(|(_, h)| h.as_slice() == &h160_bytes)
-                                    .map(|(a, _)| a.clone())
-                                    .unwrap_or_else(|| "(unknown)".to_string())
-                            } else {
-                                "(unknown)".to_string()
-                            };
-
-                            info!("\u{1f3af} GPU Hit: {} @ ts={}", matched_addr, seed.timestamp_ms);
-
-                            findings.push(VulnerabilityFinding {
-                                address: matched_addr,
-                                confidence: match phase {
-                                    Phase::One   => Confidence::High,
-                                    Phase::Two   => Confidence::Medium,
-                                    Phase::Three => Confidence::Low,
-                                },
-                                browser_config,
-                                timestamp:       seed.timestamp_ms,
-                                derivation_path: "m/0".to_string(),
-                            });
+                            }
                         }
                         processed_via_gpu = true;
                     }
@@ -525,6 +531,7 @@ impl RandstormScanner {
             timezone_offset: config.timezone_offset,
             language:        config.language.clone(),
             platform:        config.platform.clone(),
+            hash160:         None,
         }
     }
 }
