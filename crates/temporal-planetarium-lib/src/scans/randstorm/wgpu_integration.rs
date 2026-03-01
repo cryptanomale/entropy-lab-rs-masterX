@@ -127,14 +127,19 @@ mod scanner {
             self.sweep_with_fingerprints(start_ms, end_ms, interval_ms, bloom_bytes, &self.fingerprints)
         }
 
-        pub fn sweep_with_fingerprints(
+        /// Sweep with callback for incremental processing
+        pub fn sweep_with_callback<F>(
             &self,
             start_ms:     u64,
             end_ms:       u64,
             interval_ms:  u32,
             bloom_bytes:  &[u8],
             fingerprints: &[GpuFingerprint],
-        ) -> anyhow::Result<Vec<SeedComponents>> {
+            mut callback: F,
+        ) -> anyhow::Result<()>
+        where
+            F: FnMut(u64, u64, &[GpuMatchResult]) -> anyhow::Result<()>,
+        {
             if interval_ms == 0        { anyhow::bail!("interval_ms must be > 0"); }
             if end_ms < start_ms       { anyhow::bail!("end_ms must be >= start_ms"); }
             if fingerprints.is_empty() { anyhow::bail!("fingerprints must be non-empty"); }
@@ -148,11 +153,6 @@ mod scanner {
             let ts_count: u64 = (end_ms - start_ms) / interval_ms as u64 + 1;
             let fp_count: u32 = fingerprints.len() as u32;
 
-            // ── Auto-tune BATCH_TS to stay under Windows TDR ────────────────
-            // Each dispatch invocation processes one (timestamp, fingerprint) pair.
-            // We want: BATCH_TS * fp_count <= TARGET_BATCH_INVOCATIONS.
-            // Clamp to [1, 65536] and align to a multiple of 64 (workgroup size)
-            // so the last partial workgroup does not over-count.
             let batch_ts_raw = (TARGET_BATCH_INVOCATIONS / fp_count.max(1) as u64).max(1);
             let batch_ts_aligned = ((batch_ts_raw + 63) / 64) * 64;
             let batch_ts: u64 = batch_ts_aligned.min(65536).max(64);
@@ -164,13 +164,10 @@ mod scanner {
                 ts_count, fp_count, ts_count * fp_count as u64, batch_ts, total_batches
             );
 
-            // MAX_RESULTS_PER_BATCH: generous upper bound on hits in one batch.
-            // Realistically << 1000; we allocate 65536 to be safe.
             const MAX_RESULTS_PER_BATCH: u32 = 65536;
             let stride       = std::mem::size_of::<GpuMatchResult>();
             let results_size = stride * MAX_RESULTS_PER_BATCH as usize;
 
-            // ── Persistent GPU buffers (created once, reused every batch) ───
             let params_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("params"),
                 size: std::mem::size_of::<GpuParams>() as u64,
@@ -190,7 +187,6 @@ mod scanner {
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             });
-            // count_buf: COPY_DST so we can reset it with write_buffer before every batch.
             let count_buf = self.device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("count"), size: 4,
                 usage: wgpu::BufferUsages::STORAGE
@@ -221,7 +217,6 @@ mod scanner {
             });
 
             let mut offset: u64 = 0;
-            let mut all_results: Vec<GpuMatchResult> = Vec::new();
 
             while offset < ts_count {
                 let batch = (ts_count - offset).min(batch_ts) as u32;
@@ -238,13 +233,8 @@ mod scanner {
                     _pad2: 0,
                 };
                 self.queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params));
-
-                // Reset hit counter to 0 before each dispatch.
                 self.queue.write_buffer(&count_buf, 0, bytemuck::bytes_of(&0u32));
 
-                // ── Compute dispatch ────────────────────────────────────────
-                // FIX: wrap submit in push/pop_error_scope so GPU errors become
-                // Err(…) instead of a wgpu internal panic.
                 self.device.push_error_scope(wgpu::ErrorFilter::Validation);
                 self.device.push_error_scope(wgpu::ErrorFilter::OutOfMemory);
 
@@ -260,10 +250,6 @@ mod scanner {
                 }
                 self.queue.submit(std::iter::once(enc.finish()));
 
-                // ── Poll with timeout instead of blocking Maintain::Wait ────
-                // Maintain::Wait is an infinite blocking call that trips Windows TDR.
-                // We poll in a tight loop with a hard timeout; if the GPU hasn't
-                // finished by POLL_TIMEOUT_SECS we bail out cleanly.
                 let t0 = Instant::now();
                 let timeout = Duration::from_secs(POLL_TIMEOUT_SECS);
                 loop {
@@ -282,14 +268,12 @@ mod scanner {
                     }
                 }
 
-                // Drain error scopes (validation + OOM).
                 let oom_err   = pollster::block_on(self.device.pop_error_scope());
                 let valid_err = pollster::block_on(self.device.pop_error_scope());
                 if let Some(e) = oom_err.or(valid_err) {
                     anyhow::bail!("GPU error at ts_offset={}: {:?}", offset, e);
                 }
 
-                // ── Readback ────────────────────────────────────────────────
                 let mut enc2 = self.device.create_command_encoder(
                     &wgpu::CommandEncoderDescriptor { label: Some("rb") });
                 enc2.copy_buffer_to_buffer(&count_buf,   0, &count_stg,   0, 4);
@@ -328,11 +312,30 @@ mod scanner {
                     info!("Batch {}/{}: {} hits (ts_offset={})",
                         offset / batch_ts + 1, total_batches, n, offset);
                 }
-                all_results.extend_from_slice(&batch_res);
+
+                // Call callback with batch results
+                callback(offset / batch_ts + 1, total_batches, &batch_res)?;
+
                 offset += batch as u64;
             }
 
-            info!("GPU sweep complete. Total matches: {}", all_results.len());
+            info!("GPU sweep complete.");
+            Ok(())
+        }
+
+        pub fn sweep_with_fingerprints(
+            &self,
+            start_ms:     u64,
+            end_ms:       u64,
+            interval_ms:  u32,
+            bloom_bytes:  &[u8],
+            fingerprints: &[GpuFingerprint],
+        ) -> anyhow::Result<Vec<SeedComponents>> {
+            let mut all_results: Vec<GpuMatchResult> = Vec::new();
+            self.sweep_with_callback(start_ms, end_ms, interval_ms, bloom_bytes, fingerprints, |_batch, _total, results| {
+                all_results.extend_from_slice(results);
+                Ok(())
+            })?;
 
             let seeds = all_results.iter().map(|r| {
                 let ts  = ((r.timestamp_hi as u64) << 32) | r.timestamp_lo as u64;
@@ -370,8 +373,6 @@ mod scanner {
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: Some("randstorm"),
-                    // Request the maximum available limits so we don't silently
-                    // fall back to default limits on high-end adapters.
                     required_limits: wgpu::Limits::downlevel_defaults()
                         .using_resolution(adapter.limits()),
                     ..Default::default()
