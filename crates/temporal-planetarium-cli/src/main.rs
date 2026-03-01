@@ -347,7 +347,18 @@ fn get_rpc_credentials(
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt::init();
+    // FIX: Suppress verbose wgpu_core/wgpu_hal logs during GPU poll loops
+    // while keeping application-level INFO logs
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| {
+                    tracing_subscriber::EnvFilter::new("info")
+                        .add_directive("wgpu_core=warn".parse().unwrap())
+                        .add_directive("wgpu_hal=warn".parse().unwrap())
+                })
+        )
+        .init();
 
     let cli = Cli::parse();
 
