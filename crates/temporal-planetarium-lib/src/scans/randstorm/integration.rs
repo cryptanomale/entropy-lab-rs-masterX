@@ -519,7 +519,7 @@ impl RandstormScanner {
         Ok(Address::p2pkh(&pubkey, Network::Bitcoin))
     }
 
-    /// Convert browser config to seed components (uses prng::SeedComponents — no hash160)
+    /// Convert browser config to seed components
     #[allow(dead_code)]
     fn config_to_seed(&self, config: &BrowserConfig, timestamp: u64) -> SeedComponents {
         SeedComponents {
@@ -531,7 +531,6 @@ impl RandstormScanner {
             timezone_offset: config.timezone_offset,
             language:        config.language.clone(),
             platform:        config.platform.clone(),
-            hash160:         None,
         }
     }
 }
