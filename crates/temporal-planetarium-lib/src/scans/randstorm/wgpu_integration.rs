@@ -10,7 +10,7 @@
 //
 //   Fix summary:
 //   1. BATCH_TS is now computed at runtime to target ≤ TARGET_BATCH_INVOCATIONS
-//      (≈ 4 M invocations per dispatch, empirically safe on Windows TDR ≤ 2 s).
+//      (now 20 M for RTX 3080-class GPUs, tune down if TDR occurs).
 //   2. device.poll(Maintain::Wait) is replaced by a poll-loop with a hard timeout
 //      (POLL_TIMEOUT_SECS).  On timeout the sweep returns Err instead of panicking.
 //   3. push_error_scope / pop_error_scope wraps every submit so GPU validation
@@ -26,9 +26,9 @@ use crate::scans::randstorm::core_types::SeedComponents;
 pub use self::scanner::WgpuScanner;
 
 /// Target invocations per dispatch batch.
-/// 4 M is empirically safe on Windows (stays well under the 2-s TDR threshold
-/// for a heavy secp256k1 shader).  Tune down if you still hit TDR.
-const TARGET_BATCH_INVOCATIONS: u64 = 4_000_000;
+/// 20 M is tuned for RTX 3080-class GPUs. If you hit TDR ("Parent device is lost"),
+/// reduce this value to 10M or 4M.
+const TARGET_BATCH_INVOCATIONS: u64 = 20_000_000;
 
 /// Hard timeout for a single device.poll() loop iteration (seconds).
 /// If the GPU does not finish within this time we return Err so the caller
