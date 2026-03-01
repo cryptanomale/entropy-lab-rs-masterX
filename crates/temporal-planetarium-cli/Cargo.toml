@@ -14,7 +14,7 @@ temporal-planetarium-lib = { path = "../temporal-planetarium-lib" }
 clap = { version = "4.5", features = ["derive", "env"] }
 anyhow = "1.0"
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio = { version = "1.0", features = ["full"] }
 hex = "0.4"
 csv = "1.3"
